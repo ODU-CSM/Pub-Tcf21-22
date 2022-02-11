@@ -1,0 +1,64 @@
+
+## GRN of DE `r feature`s
+
+```{r, child=if (file_test('-d', inputParams$deRes)) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/grn/aggr-multi-de.Rmd')}
+```
+
+```{r, child=if (file_test('-f', inputParams$deRes)) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/grn/load-single-de.Rmd')}
+```
+
+```{r de-grn-prep} 
+featTf <- featTfFull
+if (!is.null(tfSetFile)) {
+  # use given TFs
+  if (species == 'mouse') {
+    tfsToUse <- str_to_sentence(read.table(tfSetFile)$V1)
+  } else {
+    tfsToUse <- toupper(read.table(tfSetFile)$V1)
+  }
+  if (length(which(!(tfsToUse %in% expCntFull[, expNameCol]))) > 0) {
+    put(sprintf('There is no data for the following given TF(s): %s, which will be excluded from the analysis.',
+                printNames(tfsToUse[!(tfsToUse %in% expCntFull[, expNameCol])])))
+    tfsToUse <- tfsToUse[tfsToUse %in% expCntFull[, expNameCol]]
+  }
+  featTf <-featTf[, expCntFull[match(tfsToUse, expCntFull[, expNameCol]), expIdCol]]
+  # add these TFs to feature set, if there are not there already
+  deFeats <- c(deFeats, colnames(featTf))
+  deFeats <- unique(deFeats)
+} else {
+  # identify TFs that are among the top differentially expressed, 
+  # if there is any, keep those TFs only
+  deTfs <- colnames(featTf)[colnames(featTf) %in% deFeats]
+  if (length(deTfs) > 0) {
+    featTf <- featTf[, deTfs]
+  } else {
+    # include all TFs
+    deFeats <- c(deFeats, colnames(featTf))
+  }
+}
+
+# retain only DE features
+expCnt <- expCntFull[expCntFull[, expIdCol] %in% deFeats, ]
+# include only genes with potential regulatory being identified
+expCnt <- expCnt[expCnt[, expIdCol] %in% rownames(featTf), ] 
+
+if (inputParams$coeMode == 'lfc' && !is.null(expLfc)) {
+  # use log fold change to compute co-expression correlation
+  # replace the expression data with lfc
+  expCnt <- cbind(expCnt[, 1:(expDataSCol - 1)], expLfc[expCnt[, expIdCol], ])
+}
+
+# retain only genes in featTf that are included in expCnt
+featTf <- featTf[rownames(featTf) %in% expCnt[, expIdCol], ]
+```
+
+<!-- `r if (!is.null(tfSetFile)) sprintf('Only the following pre-given TFs are included: %s in the analysis.', printNames(tfsToUse))` `r if (length(deTfs) > 0) sprintf('Among the %ss retained for analysis, there are %d TFs, including %s. Only these TFs are considered in the subsequent network reconstruction.', feature, length(deTfs), printNames(expCntFull[match(deTfs, expCntFull[, expIdCol]), expNameCol]))` `r if (length(deTfs) == 0) sprintf('There is no TF among the %ss retained for analysis; all TFs are included in the subsequent network reconstruction.', feature)` -->
+
+```{r de-gene-grn}
+fSetName <- 'de'
+out <- knitr::knit_expand('grn.Rmd')
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+

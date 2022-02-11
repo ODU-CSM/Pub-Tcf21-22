@@ -1,0 +1,67 @@
+
+
+### `r gsub('[feature]', feature, featSets$Title[{{iDea}}], fixed = TRUE)`
+
+```{r dea-{{iDea}}-setup}
+iDea <- {{iDea}}
+indDeaDir <- sprintf('%s/%s', deaOutDir, featSets$feat_set[iDea])
+if (!dir.exists(indDeaDir)) dir.create(indDeaDir)
+indDeaFigDir <- sprintf('%s/figures', indDeaDir)
+if (!dir.exists(indDeaFigDir)) dir.create(indDeaFigDir)
+
+figDirBk <- knitr::opts_chunk$get('fig.path')
+knitr::opts_chunk$set(fig.path = paste0(indDeaFigDir, '/'))
+```
+
+`r gsub('[feature]', feature, featSets$Desc[iDea], fixed = TRUE)` All result files from the analysis within this subsection as mentioned in below can be found in folder `r sprintf('*de-vs-da/%s*', featSets$feat_set[iDea])`, including figures, which were saved to the *figures* subfolder.
+
+```{r dea-{{iDea}}-data}
+# create feature sets resulted from comparisons
+# DE features
+deSets <- list()
+comps <- strsplit(featSets$DE[iDea], split = ';')[[1]]
+for (comp in comps) {
+  compRes <- read.csv(sprintf('%s/%s.csv', deResDir, comp))
+  deSet <- compRes[compRes$significant, 1]
+  if (length(deSet) > 0) {
+    deSets[[comp]] <-deSet
+  }
+}
+# DA promoters
+daSets <- list()
+comps <- strsplit(featSets$DA[iDea], split = ';')[[1]]
+for (comp in comps) {
+  compRes <- read.csv(sprintf('%s/%s.csv', daResDir, comp))
+  daSet <- compRes[compRes$significant, 1]
+  if (length(daSet) > 0) {
+    daSets[[comp]] <- daSet
+  }
+}
+
+ovlTbl <- featClusOvl(deSets, daSets, outDataDir = indDeaDir, 
+            nTtlObs1 = nrow(expFull), nTtlObs2 = nrow(accFull), anno = anno,
+            nComm = length(which(rownames(expFull) %in% rownames(accFull))))
+
+```
+
+`r str_to_sentence(feature)` sets and promoter sets identified in included comparisons were cross compared. Overlapping between the two sets in each pairwise was computed. For each calculated overlap, a statistic test was performed to evaluate that how likely the overlap happens by random. As a result, a p-value was obtained. The smaller the p-value is, the less likely the overlap happens in random. The overlap count table, tested raw p-values and the adjusted p-values (FDR) were saved to files: *ovl-cnt.csv*, *ovl-raw-pv.csv* and *ovl-adj-pv.csv*. In these files, the rows represent `r feature` sets identified in differential expression analysis; while the columns represent promoter sets identified in accessibility differential analysis. The overlap count table and the adjusted p-value table were plotted in the following two heatmaps.
+
+Heatmap of overlap count table (*dea-`r iDea`-cntmap.pdf*)
+
+```{r dea-{{iDea}}-cntmap, fig.width=6.5, fig.height=5, dev=c('png', 'pdf')}
+ovlTbl$cntPlot
+```
+
+Heatmap of adjust p-values (*dea-`r iDea`-pvmap.pdf*)
+
+```{r dea-{{iDea}}-pvmap, fig.width=6.5, fig.height=5, dev=c('png', 'pdf')}
+ovlTbl$pvPlot
+```
+
+
+The overlapping `r feature`s from each pairwise comparison where the overlapping is statistically significant (adjusted p-value < 0.05) were save to folder *ovl-feat*. In this folder, all files follow a format row[$i$]-col[$j$].csv, with $i$ and $j$ referring to the $i$-th row and $j$-th column in the count table. 
+
+```{r dea-{{iDea}}-clean}
+# restore
+knitr::opts_chunk$set(fig.path = figDirBk)
+```

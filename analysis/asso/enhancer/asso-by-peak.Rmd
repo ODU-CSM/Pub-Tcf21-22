@@ -1,0 +1,118 @@
+
+
+### `r gsub('[feature]', feature, peakSets$Title[{{iDp}}], fixed = TRUE)`
+
+```{r exp-dp-{{iDp}}-setup}
+iDp <- {{iDp}}
+indDaDir <- sprintf('%s/%s', dpOutDir, peakSets$feat_set[iDp])
+if (!dir.exists(indDaDir)) dir.create(indDaDir)
+indDaFigDir <- sprintf('%s/figures', indDaDir)
+if (!dir.exists(indDaFigDir)) dir.create(indDaFigDir)
+```
+
+`r gsub('[feature]', feature, peakSets$Desc[iDp], fixed = TRUE)` All result files from the analysis within this subsection as mentioned in below can be found in folder `r sprintf('*diff-peak/%s*', peakSets$feat_set[iDp])`, including figures, which were saved to the *figures* subfolder.
+
+```{r exp-dp-{{iDp}}-data}
+# pool DA peaks of interest
+# use a peak-group association table to facilitate the assigning peaks to groups
+peakGrpAsso <- matrix(rep(0, nrow(dstlPeaks) * length(accSGrps)), nrow = nrow(dstlPeaks))
+rownames(peakGrpAsso) <- rownames(dstlPeaks)
+colnames(peakGrpAsso) <- accSGrps
+
+# pool features resulted from comparisons
+comps <- strsplit(peakSets$Comparions[iDp], split = ';')[[1]]
+for (comp in comps) {
+  compRes <- read.csv(sprintf('%s/%s.csv', daPeakDir, comp))
+  # case and control groups in the comparison
+  case <- strsplit(accComps$Case[accComps$Comparison == comp], split = ';')[[1]]
+  ctrl <- strsplit(accComps$Control[accComps$Comparison == comp], split = ';')[[1]]
+  
+  # update peakGrpAsso matrix by adding DA peaks from the comparison
+  peakUp <- compRes[compRes$significant & compRes$direction == 'UP', 2:4]
+  peakUp <- paste(peakUp[, 1], peakUp[, 2], peakUp[, 3], sep = ':')
+  peakUp <- peakUp[peakUp %in% rownames(dstlPeaks)]
+  peakGrpAsso[peakUp, case] <- peakGrpAsso[peakUp, case] + 1
+  
+  peakDown <- compRes[compRes$significant & compRes$direction == 'DOWN', 2:4]
+  peakDown <- paste(peakDown[, 1], peakDown[, 2], peakDown[, 3], sep = ':')
+  peakDown <- peakDown[peakDown %in% rownames(dstlPeaks)]
+  peakGrpAsso[peakDown, ctrl] <- peakGrpAsso[peakDown, ctrl] + 1
+}
+
+# retain only peaks that are tested significant
+peakGrpAsso <- peakGrpAsso[rowSums(peakGrpAsso) > 0, ]
+# assign feature to group according to peakGrpAsso
+peakGrpAssn <- apply(peakGrpAsso, 1, function(x) return(colnames(peakGrpAsso)[which.max(x)]))
+peakByGrp <- list()
+for (grp in accSGrps) { # maintain the original group appearing order
+  if (length(which(peakGrpAssn == grp)) > 0) {
+    peakByGrp[[grp]] <- names(peakGrpAssn)[peakGrpAssn == grp]
+  }
+}
+
+peakGrpAssnOut <- cbind(feat = rownames(peakGrpAsso), group = peakGrpAssn)
+colnames(peakGrpAssnOut)[1] <- names(expInData)[expIdCol]
+write.csv(peakGrpAssnOut, paste0(indDaDir, '/group-assign.csv'),
+          row.names = FALSE, quote = FALSE)
+```
+
+Peaks identified in included comparisons were pooled together. In total, there are `r nrow(peakGrpAsso)` identified peaks. These peaks were assigned to the sample group where their accessibility is the most prominent. This assignment was saved to *group-assign.csv*. The distribution of the peaks across the sample groups is provided in the following table.
+
+
+```{r exp-dp-{{iDp}}-pdist}
+grps <- names(peakByGrp)
+cnts <- rep(0, length(grps))
+for (i in 1:length(grps)) {
+  cnts[i] <- length(peakByGrp[[i]])
+}
+featDist <- cbind(Group = grps, 'Number of peaks' = cnts)
+knitr::kable(featDist, row.names = FALSE, align = 'lc',
+             caption = 'The distribution of peaks across sample groups')
+```
+
+Below is a Heatmap (*zscore-heatmap.pdf*) that shows the peak accessibility, expression level of paired `r feature`s, and peak CpG density . The data of accessibility and expression were standardized such that each row has mean 0 and standard deviation 1 (zscore). `r str_to_sentence(feature)`s are grouped according to their expression dynamics across samples, i.e., constantly low, constantly high and dynamic, as indicated by the left most color bar. 
+ 
+```{r exp-dp-{{iDp}}-hmap, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+draw(combHeatmap(peakByGrp, expGrp = strsplit(peakSets$Groups_in_exp[iDp], split = ';')[[1]], 
+                 accGrp = strsplit(peakSets$Groups_in_acc[iDp], split = ';')[[1]], featByClus = expClus,
+                 expData = expNorm, accData = peakNorm, cpgDens = peakCpgDens, anaDataType = 'acc',
+                 saveToFile = sprintf('%s/zscore-heatmap', indDaFigDir),
+                 featPairing = closFeat))
+```
+
+The following are histograms of the correlation between accessibility of included peaks and the expression of their paired `r feature`s. The correlation was computed using data of samples from all groups in the two datasets. From left to right, top to bottom, the figures include all peaks and those with low, medium and high CpG density, respectively. Each individual figure can be found under directory: *ea-cor-by-peak*.
+
+```{r exp-dp-{{iDp}}-cor, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+# compute correlation between acc and exp for each gene and plot
+figSubDir <- paste0(indDaFigDir, '/ea-cor-by-peak')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+peakSel <- names(peakGrpAssn)
+peakSel <- peakSel[peakSel %in% rownames(epCorByPeak)]
+corOfSelPks<- epCorByPeak[peakSel, 'cor']
+names(corOfSelPks) <- peakSel
+plotCorrByCD(corOfSelPks, dstlByCpGDens, saveToDir = figSubDir)
+```
+
+Below is a panel of scatter plots of peaks and their paired `r feature`s according to accessibility (log2(TPM)) and expression level (log2(TPM)), respectively (*ea-by-grp.pdf*). Each subplot only contains peaks that are the most accessible in the corresponding sample group. To compute the correlation, the average expression/accessibility was first computed among the samples from a group for each involved `r feature`/peak, followed by calculating the correlation with each `r feature`/promoter being used as observation. If there are not enough `r feature`s (> 1) in a setting, the corresponding scatter plot is not drawn, resulting an empty slot in the panel below. 
+
+```{r exp-dp-{{iDp}}-eaa1, message=FALSE, results=FALSE, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+# correlation over sample specific feature
+grpsInc <- unique(peakGrpAssn)
+grpsInc <- grpsInc[grpsInc %in% grpInCom]
+grpsInc <- as.character(sort(factor(grpsInc, levels = accSGrps)))
+p <- plotExpAndAcc(extractData(expUseCom, closFeat[peakSel, 1]), peakTpmCom[peakSel, ], 
+              grpsInc, featByCpGDens = dstlByCpGDens, fGrpAssn = peakGrpAssn[peakSel], frac = minTpm, 
+              saveToFile = paste0(indDaFigDir, '/ea-by-grp'))
+grid.draw(p)
+```
+
+The following (*exp-and-acc.pdf*) is a similar plot where all `r feature`s are included in every subplot, in other words not just the `r feature`s whose promoter were the most accessible in samples from the corresponding group.   
+
+
+```{r exp-dp-{{iDp}}-eaa2, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+p <- plotExpAndAcc(extractData(expUseCom, closFeat[peakSel, 1]), peakTpm[peakSel, ], 
+              grpsInc, featByCpGDens = dstlByCpGDens, frac = minTpm,
+              saveToFile = paste0(indDaFigDir, '/exp-and-acc'))
+grid.draw(p)
+```

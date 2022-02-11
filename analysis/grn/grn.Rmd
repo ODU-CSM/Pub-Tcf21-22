@@ -1,0 +1,254 @@
+
+```{r {{fSetName}}-setup}
+sOutDir <- sprintf('%s/%s', outDir, fSetName)
+if (!dir.exists(sOutDir)) dir.create(sOutDir)
+
+sDataDir <- sprintf('%s/data', sOutDir)
+if (!dir.exists(sDataDir)) dir.create(sDataDir)
+
+sFigDir <- sprintf('%s/figures', sOutDir)
+if (!dir.exists(sFigDir)) dir.create(sFigDir)
+
+knitr::opts_chunk$set(fig.path = paste0(sFigDir, '/'))
+```
+
+All mentioned result files, both data or figures (if any), from the analysis within this section can be found in folder `r sprintf('*%s*', fSetName)`.
+
+```{r {{fSetName}}_clean-data}
+# work with gene name, exclude duplicated gene name by retaining the copy that has the largest 
+# number of read counts
+dupNames <- unique(expCnt[duplicated(expCnt[, expNameCol]), expNameCol])
+if (length(dupNames) > 0) {
+  write.table(dupNames, paste0(sDataDir, '/dup-genes.txt'), 
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+}
+
+isRowToDel <- rep(FALSE, nrow(expCnt))
+for (dupName in dupNames) {
+  iRows <- which(expCnt[, expNameCol] == dupName)
+  iRowMax <- which.max(rowSums(abs(expCnt[iRows, expDataSCol:ncol(expCnt)])))
+  iRowToDel <- iRows[-iRowMax]
+  isRowToDel[iRowToDel] <- TRUE
+}
+expCnt <- expCnt[!isRowToDel, ]
+cntMat <- as.matrix(expCnt[, expDataSCol:ncol(expCnt)])
+rownames(cntMat) <- expCnt[, expNameCol]
+
+# remove duplicated feature from TF binding as well
+featTf <- featTf[expCnt[, expIdCol], ]
+rownames(featTf) <- expCnt[, expNameCol]
+
+# use gene name for TF as well
+colnames(featTf) <- expCntFull[match(colnames(featTf), expCntFull[, expIdCol]), expNameCol]
+
+# exclude TFs that have no expression
+nTtlTf <- ncol(featTf) # the total number TFs in the input featTf matrix
+tfAct <- colnames(featTf)[colnames(featTf) %in% rownames(cntMat)]
+featTf <- featTf[, tfAct]
+
+sumFltDup <- function() {
+  desc <- sprintf('There are %d %ss that have duplicated rows (by name of the %s) ', length(dupNames), feature, feature)
+  if (inputParams$coeMode == 'lfc') {
+    paste0(desc, 'in the given log of fold change file ')
+  } else {
+    paste0(desc, 'in the given read count file ')
+  }
+  desc <- paste0(desc, 'and were saved to *dup-genes.txt*.' )
+  desc <- sprintf('%s For each such %s, the duplicate with the maximum ', desc, feature)
+  if (inputParams$coeMode == 'lfc') {
+    desc <- paste0(desc, 'sum of absolute value of log fold change across all pairwise comparisons ')
+  } else {
+    desc <- paste0(desc, 'total counts across all samples ')
+  }
+  desc <- paste0(desc, 'was retained and all the rest were removed. ',
+                 sprintf('After the removal, there were %s %ss left for analysis. ', printNum(nrow(featTf)), feature))
+  return(desc)
+}
+```
+
+`r if (length(dupNames) > 0) sumFltDup()` `r if (nTtlTf - ncol(featTf) > 0) sprintf('Among the %d TFs, there are %d TFs that had no expression and were excluded, leaving %d for subsequent analysis. ', nTtlTf, nTtlTf - ncol(featTf), ncol(featTf))`
+
+### Network reconstruction by predicted TF binding only
+
+```{r {{fSetName}}_grn-mot}
+# network constructed by considering TF binding
+netByTB <- featTf
+# exclude self-edge
+for (tf in tfAct) {
+  netByTB[tf, tf] <- 0
+}
+write.csv(netByTB, paste0(sDataDir, '/net-by-tb.csv'), quote = FALSE)
+
+# total TF-target pairs
+nTtlPairs <- nrow(netByTB) * ncol(netByTB)
+```
+
+A network was reconstructed based on only the predicted TF binding (saved to *net-by-tb.csv*). In this network, there are `r printNum(length(which(netByTB == 1)))` edges, i.e., `r sprintf('%.2f%%', length(which(netByTB == 1)) * 100 / nTtlPairs)` out of the total `r printNum(nTtlPairs)` TF-target pairs. 
+
+The number of regulating TFs was counted for each gene. The plot below (*nTF-by-tb-hist-1.pdf*) shows its distribution among all genes. The data used in this plot can be found in *tf-by-tb-stat.csv*.
+
+```{r nTF-by-tb-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTfByTBPlotDf <- data.frame(nTf = apply(netByTB, 1, function(x) return(sum(x))))
+write.csv(cbind(gene = rownames(netByTB), nTfByTBPlotDf),
+          paste0(sDataDir, '/tf-by-tb-stat.csv'), row.names = F, quote = F)
+
+ggplot(nTfByTBPlotDf, aes(x = nTf)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of regulating TFs', y = 'Frequency of genes')
+rm(nTfByTBPlotDf)
+```
+
+The number of target genes was counted for each TF. The following histogram (*nTrt-by-tb-hist-1.pdf*) shows its distribution among all TFs. The data used in the plot can be found in *trt-by-tb-stat.csv*.
+
+```{r nTrt-by-tb-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTrtByTBPlotDf <- data.frame(nTrt = apply(netByTB, 2, function(x) return(sum(x))))
+write.csv(cbind(colnames(netByTB), nTrtByTBPlotDf),
+          paste0(sDataDir, '/trt-by-tb-stat.csv'), row.names = F, quote = F)
+ggplot(nTrtByTBPlotDf, aes(x = nTrt)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of targets', y = 'Frequency of TFs')
+rm(nTrtByTBPlotDf)
+```
+
+### Network reconstruction by gene co-expression only
+
+```{r {{fSetName}}_grn-exp}
+# calculate correlation among features
+if (inputParams$coeMode == 'group-average') {
+  # use group average to calculate correlation
+  # load group specification
+  sampGrpSpec <- read.csv(inputParams$expSampGrpSpec)
+  sampGrps <- unique(sampGrpSpec$Group)
+  cntMatTmp <- matrix(rep(0, nrow(cntMat) * length(sampGrps)), nrow = nrow(cntMat))
+  rownames(cntMatTmp) <- rownames(cntMat)
+  colnames(cntMatTmp) <- sampGrps
+  for (grp in sampGrps) {
+    cntMatTmp[, grp] <- apply(cntMat[, sampGrpSpec$Sample[sampGrpSpec$Group == grp], drop = F], 1, 
+                              function(x) return(mean(x)))
+  }
+  cntMat <- cntMatTmp
+  rm(sampGrpSpec, sampGrps, cntMatTmp)
+} 
+fcor <- cor(t(cntMat), t(cntMat[tfAct,]), method = 'pearson')
+write.csv(data.frame(gene = rownames(cntMat), fcor), paste0(sDataDir, '/gene-coe-cor.csv'),
+          row.names = F, quote = F)
+
+netByCe <- matrix(rep(0, nrow(fcor) * ncol(fcor)), nrow = nrow(fcor))
+colnames(netByCe) <- colnames(fcor)
+rownames(netByCe) <- rownames(fcor)
+
+netByCe[fcor >= minCor] <- 1    # 1 indicating activate
+netByCe[fcor <= -1 * minCor] <- -1 # -1 indicating inhibit
+# exclude self-edge
+for (tf in tfAct) {
+  netByCe[tf, tf] <- 0
+}
+write.csv(netByCe, paste0(sDataDir, '/net-by-ce.csv'), quote = FALSE)
+
+printCoeMode <- function() {
+  if (inputParams$coeMode == 'single-gene') {
+    print('expression quantification at individual gene level')
+  } else if (inputParams$coeMode == 'group-average'){
+    print('group average of expression quantification')
+  } else if (inputParams$coeMode == 'lfc') {
+    print('log of fold change from pairewise comparisons')
+  } else {
+    print('unknown coeMode mode')
+  }
+}
+```
+
+A network was also reconstructed based on co-expression between the TF and the target `r feature`. The co-expression between each pair of TF and target `r feature` was measured by Pearson correlation calculated using `r printCoeMode()`. The obtained correlation for all pairs can be found in *gene-coe-cor.csv*. An edge between a TF and a target was established when the absolute value of the correlation between them was no less than `r minCor`, with the positive correlation implying positive regulation (i.e., promotion) and negative correlation indicating negative regulation (i.e., inhibition). The reconstructed network was saved to *net-by-ce.csv*, in which value 0 means no edge, 1 indicates positive regulation, -1 represents negative regulation. In this network, there are `r printNum(length(which(netByCe == 1)))` (i.e., `r sprintf('%.2f%%', length(which(netByCe == 1)) * 100 / nTtlPairs)` out of all TF-target pairs) positive regulatory links (edges) and `r printNum(length(which(netByCe == -1)))` (i.e., `r sprintf('%.2f%%', length(which(netByCe == -1)) * 100 / nTtlPairs)` out of all TF-target pairs) negative regulatory links. 
+
+The number of regulating TFs was counted for each gene. The plot below (*nTF-by-ce-hist-1.pdf*) shows its distribution among all genes. The data used in this plot can be found in *tf-by-ce-stat.csv*.
+
+```{r nTF-by-ce-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTfByCePlotDf <- data.frame(nTf = apply(netByCe, 1, function(x) return(sum(abs(x)))))
+write.csv(cbind(gene = rownames(netByCe), nTfByCePlotDf),
+          paste0(sDataDir, '/tf-by-ce-stat.csv'), row.names = F, quote = F)
+
+ggplot(nTfByCePlotDf, aes(x = nTf)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of regulating TFs', y = 'Frequency of genes')
+rm(nTfByCePlotDf)
+```
+
+The number of target genes was counted for each TF. The following histogram (*nTrt-by-ce-hist-1.pdf*) shows its distribution among all TFs. The data used in the plot can be found in *trt-by-ce-stat.csv*.
+
+```{r nTrt-by-ce-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTrtByCePlotDf <- data.frame(nTrt = apply(netByCe, 2, function(x) return(sum(abs(x)))))
+write.csv(cbind(gene = colnames(netByCe), nTrtByCePlotDf),
+          paste0(sDataDir, '/trt-by-ce-stat.csv'), row.names = F, quote = F)
+ggplot(nTrtByCePlotDf, aes(x = nTrt)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of targets', y = 'Frequency of TFs')
+rm(nTrtByCePlotDf)
+```
+
+### Network reconstruction by considering both predicated TF binding and gene co-expression
+
+```{r {{fSetName}}_grn-both} 
+netByBoth <- netByCe
+netByBoth <- netByBoth[rownames(netByTB), colnames(netByTB)] # make sure rows and column line up
+netByBoth[netByTB == 0] <- 0
+write.csv(netByBoth, paste0(sDataDir, '/net-by-both.csv'), quote = FALSE)
+
+# create a sif file for visualization
+posLnks <- convMatIdx1to2(which(netByBoth == 1), nrow(netByBoth), ncol(netByBoth))
+negLnks <- convMatIdx1to2(which(netByBoth == -1), nrow(netByBoth), ncol(netByBoth))
+sif <- rbind(data.frame(tf = colnames(netByBoth)[posLnks[, 2]], type = rep('+', nrow(posLnks)), target = rownames(netByBoth)[posLnks[, 1]]),
+             data.frame(tf = colnames(netByBoth)[negLnks[, 2]], type = rep('-', nrow(negLnks)), target = rownames(netByBoth)[negLnks[, 1]]))
+# sort by TF
+sif <- sif[sort(sif$tf, index.return = TRUE)$ix, ]
+write.table(sif, paste0(sDataDir, '/net-by-both.sif'), quote = FALSE, 
+            row.names = FALSE, col.names = FALSE, sep = '\t')
+```
+
+The above two networks (i.e., one by predicted TF binding only and one by co-expression only) were combined to reconstruct the final network by removing links in the network by co-expression that do not appear in the network by predicted TF binding. The final network was saved to *net-by-both.csv*. In this network, there are `r printNum(length(which(netByBoth == 1)))` (i.e., `r sprintf('%.2f%%', length(which(netByBoth == 1)) * 100 / nTtlPairs)` out of all pairs) positive regulatory links (edges) and `r printNum(length(which(netByBoth == -1)))` (i.e., `r sprintf('%.2f%%', length(which(netByBoth == -1)) * 100 / nTtlPairs)` out of all pairs) negative regulatory links. 
+
+The number of regulating TFs was counted for each gene. The plot below (*nTF-by-both-hist-1.pdf*) shows its distribution among all genes. The data used in this plot can be found in *tf-by-both-stat.csv*.
+
+```{r nTF-by-both-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTfByBothPlotDf <- data.frame(nTf = apply(netByBoth, 1, function(x) return(sum(abs(x)))))
+write.csv(cbind(gene = rownames(netByBoth), nTfByBothPlotDf),
+          paste0(sDataDir, '/tf-by-both-stat.csv'), row.names = F, quote = F)
+
+ggplot(nTfByBothPlotDf, aes(x = nTf)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of regulating TFs', y = 'Frequency of genes')
+rm(nTfByBothPlotDf)
+```
+
+The number of target genes was counted for each TF. The following histogram (*nTrt-by-both-hist-1.pdf*) shows its distribution among all TFs. The data used in the plot can be found in *trt-by-both-stat.csv*.
+
+```{r nTrt-by-both-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTrtByBothPlotDf <- data.frame(nTrt = apply(netByBoth, 2, function(x) return(sum(abs(x)))))
+write.csv(cbind(gene = colnames(netByBoth), nTrtByBothPlotDf),
+          paste0(sDataDir, '/trt-by-both-stat.csv'), row.names = F, quote = F)
+ggplot(nTrtByBothPlotDf, aes(x = nTrt)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of targets', y = 'Frequency of TFs')
+rm(nTrtByBothPlotDf)
+```
+
+```{r grn-clean-up}
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+```

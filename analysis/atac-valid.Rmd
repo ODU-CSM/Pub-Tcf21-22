@@ -1,0 +1,800 @@
+---
+title: "`r params$title`"
+author: "`r params$author`"
+date: "`r params$date`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document:
+    latex_engine: xelatex
+bibliography: literature.bib
+params:
+  title: Whole-genome ATAC data validation
+  author: Javon
+  date: January 7, 2021
+  readCountFile: null
+  idCol: 1
+  annCols: 2;3;4
+  dataStartCol: 5
+  feature: bin
+  featBedFile: null
+  featBedIdCol: null
+  startCoorCol: 3
+  endCoorCol: 4
+  sampGrpSpecFile: null
+  sampGrp1Meta: null
+  sampGrp2Meta: null
+  output: null
+  logFile: null
+  minCntForFeat: 3
+  minCntForSamp: 2e4
+  minSampSCorr: 0.45
+  minAcc: 0.1
+  minNSamp: null
+  minNAnaSamp: 4
+  minNAnaFeat: 2000
+  tsnePerplexity: 2
+---
+
+```{r set-up, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+inputParams <- params
+# set up for testing
+test = FALSE
+if (test) {
+  inputRootDir <- '/scratch/ml-csm/projects/tissue-regen/analysis/mouse-cardiac-fibro/ana-123120/atac'
+  outputRootDir <- '/scratch/ml-csm/projects/tissue-regen/analysis/mouse-cardiac-fibro/ana-072921/atac/validation'
+  
+  inputParams$readCountFile <- paste0(inputRootDir, '/data/peakar/pk-qtf/data/no-grp/counts.with-anno.csv')
+  inputParams$sampGrpSpecFile <- paste0(inputRootDir, '/data/samp-grp.csv')
+  inputParams$sampGrp1Meta <- paste0(outputRootDir, '/../../config/samp-grp1.meta.csv')
+  inputParams$output <- paste0(outputRootDir, '/results/peak')
+  inputParams$logFile <- paste0(outputRootDir, '/run-log/val-peak.log')
+}
+```
+
+```{r valid-input, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+if (is.null(inputParams$readCountFile)) {
+  stop('Input - readCountFile is required')
+}
+if (is.null(inputParams$sampGrpSpecFile)) {
+  stop('Input - sampGrpSpecFile is required')
+}
+if (is.null(inputParams$output)) {
+  stop('Input - output is required')
+}
+```
+
+## Note
+All figures can be found in the figures folder under the given output directory.
+
+```{r init, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Bioconductor
+library(DESeq2)
+library(scater)
+
+# CRAN
+library(ggrepel)
+library(RColorBrewer)
+library(viridis)
+library(ggplot2)
+library(gridExtra)
+library(pheatmap)
+library(factoextra)
+library(Rtsne)
+library(logr)
+library(english)
+library(corrplot)
+library(PoiClaClu)
+
+options(stringsAsFactors = FALSE)
+
+readCountFile <- inputParams$readCountFile
+feature <- inputParams$feature
+idCol <- inputParams$idCol 
+annCols <- inputParams$annCols
+if (!is.null(annCols) && !is.integer(annCols)) {
+  annCols <- as.integer(strsplit(annCols, ';')[[1]])
+}
+dataStartCol <- inputParams$dataStartCol
+
+if (feature == 'gene promoter') {
+  if (is.null(inputParams$featBedFile)) {
+    stop('Input - featBedFild is required')
+  }
+  if (is.null(inputParams$featBedIdCol)) {
+    stop('Input - featBedIdCol is required')
+  }
+  featBedFile <- inputParams$featBedFile
+  featBedIdCol <- inputParams$featBedIdCol
+}
+
+startCoorCol <- inputParams$startCoorCol
+endCoorCol <- inputParams$endCoorCol
+sampGrpSpecFile <- inputParams$sampGrpSpecFile
+output <- inputParams$output
+logFile <- inputParams$logFile
+
+# set up color of sample groups in plooting
+sampGrpClr <- NULL # color is determined by group1
+if (!is.null(inputParams$sampGrp1Meta)) {
+  sampGrp1Meta <- read.csv(inputParams$sampGrp1Meta)
+  if ('Color' %in% names(sampGrp1Meta)) {
+    sampGrpClr <- sampGrp1Meta$Color
+    names(sampGrpClr) <- sampGrp1Meta$ID
+  }
+}
+
+minCntForFeat <- inputParams$minCntForFeat
+minCntForSamp <- as.integer(inputParams$minCntForSamp)
+minSampSCorr <- inputParams$minSampSCorr
+minAcc <- inputParams$minAcc 
+minNSamp <- inputParams$minNSamp
+
+minNAnaSamp <- inputParams$minNAnaSamp
+minNAnaFeat <- inputParams$minNAnaFeat
+
+tsnePerplexity <- inputParams$tsnePerplexity
+
+# set up output folders
+outDataDir <- paste0(output, '/data')
+if (!dir.exists(outDataDir)) dir.create(outDataDir)
+figDir <- paste0(output, '/figures')
+if (!dir.exists(figDir)) dir.create(figDir)
+
+# set up log
+if (is.null(logFile)) {
+  logFile <- file.path(tempdir(), "validation.log")
+}
+logger <- log_open(logFile, logdir = FALSE)
+options("logr.notes" = FALSE)
+
+# log passed in running parameters
+put("Input parameters: ", console = FALSE)
+put(paste("readCountFile=", inputParams$readCountFile), console = FALSE)
+
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+knitr::opts_chunk$set(dev.args = list(png = list(type = "cairo")))
+```
+
+
+```{r load-data, echo=FALSE}
+inputData <- read.csv(readCountFile)
+
+# process sample grouping
+sampGrpSpec <- read.csv(sampGrpSpecFile, stringsAsFactors = FALSE)
+sampGrpStartCol <- 3
+sampOfGrp <- list()
+iGrping <- 1
+for (col in sampGrpStartCol:min(sampGrpStartCol + 1, ncol(sampGrpSpec))) {
+  sog <- list()
+  sampGrps <- unique(sampGrpSpec[, col])
+
+  if (col == sampGrpStartCol) {
+    # pool samples only once
+    sampUse <- NULL # only use samples in the sample group specification file
+  }
+  
+  for (i in 1:length(sampGrps)) {
+    sog[[i]] <- sampGrpSpec[sampGrpSpec[, col] == sampGrps[i], 1]
+    if (length(which(!(sog[[i]] %in% names(inputData)))) > 0) {
+      stop(sprintf('Sample(s): %s in sampGrpSpecFile cannot be found in readCountFile', 
+                   paste0(sog[[i]][which(!(sog[[i]] %in% names(inputData)[dataStartCol:ncol(inputData)]))], 
+                        collapse = ';')))
+    }
+    if (col == sampGrpStartCol) {
+      sampUse <- c(sampUse, sog[[i]])
+    }
+  }
+  
+  names(sog) <- sampGrps
+  sampOfGrp[[iGrping]] <- sog
+  iGrping <- iGrping + 1
+}
+
+# set minNSamp, if not provided
+if (is.null(minNSamp)) {
+  #  set to min(1, ceiling(minGrpSize/2)), where minGrpSize 
+  # is the size of the smallest sample group.
+  sog <- sampOfGrp[[1]] # use the first way of grouping
+  minGrpSize <- length(sog)
+  for (i in 2:length(sog)) {
+    minGrpSize <- min(minGrpSize, length(sog[[i]]))
+  }
+  minNSamp <- min(1, ceiling(minGrpSize / 2)) 
+}
+
+if (exists('featBedFile') && !is.null(featBedFile)) {
+  featBed <- read.table(featBedFile, sep = '\t')
+}
+```
+
+```{r functions}
+printNum <- function(number) {
+  if (is.null(number)) {
+    return(english(0))
+  }
+  
+  if (number < 10) {
+    return(english(number))
+  } else {
+    return(prettyNum(number, big.mark = ','))
+  }
+}
+
+printNames <- function(nms) {
+  if (length(nms) == 1) {
+    return(nms)
+  }
+  str <- paste(nms[1:(length(nms) - 1)], collapse = ', ')
+  str <- sprintf('%s and %s', str, nms[length(nms)])
+  return(str)
+}
+
+getGrps <- function(grping = 1) {
+  return(names(sampOfGrp[[grping]]))
+}
+
+getSampGrp <- function(samps, grping = 1) {
+  return(sampGrpSpec[match(samps, sampGrpSpec$Sample), sampGrpStartCol + grping - 1])
+}
+
+earlyExit <- function(cnts) {
+  if (nrow(cnts) < minNAnaFeat || ncol(cnts) < minNAnaSamp) {
+    cat(sprintf(paste0('**Note: subsequent analysis was not done due to no sufficient data left in the analysis. ', 
+                 'There should be data for minimum %s samples and %s %ss**'), printNum(minNAnaSamp), 
+                printNum(minNAnaFeat), feature))
+    knitr::knit_exit()
+  }
+}
+```
+
+## Data Info
+```{r data-info}
+printSampGrpDetail <- function() {
+  if (length(sampOfGrp) == 1) {
+    sog <- sampOfGrp[[1]]
+    str <- sprintf('There are %s groups in this way of grouping, which are:', printNum(length(sog)))
+    for (grp in names(sog)[1:(length(sog) - 1)]) {
+      str <- sprintf('%s %s(N = %d),', str, grp, length(sog[[grp]]))
+    }
+    str <- sprintf('%s and %s(N = %d)', str, names(sog)[length(sog)], length(sog[[length(sog)]]))
+    return(str)
+  } else {
+    # first way of grouping
+    sog <- sampOfGrp[[1]] 
+    str <- sprintf('There are %s groups in the first way of grouping, which are:', printNum(length(sog)))
+    for (grp in names(sog)[1:(length(sog) - 1)]) {
+      str <- sprintf('%s %s(N = %d),', str, grp, length(sog[[grp]]))
+    }
+    str <- sprintf('%s and %s(N = %d)', str, names(sog)[length(sog)], length(sog[[length(sog)]]))
+    
+    # second way of grouping
+    sog <- sampOfGrp[[2]] 
+    str <- sprintf('%s; there are %s groups in the second way of grouping, which are:', str, printNum(length(sog)))
+    for (grp in names(sog)[1:(length(sog) - 1)]) {
+      str <- sprintf('%s %s(N = %d),', str, grp, length(sog[[grp]]))
+    }
+    str <- sprintf('%s and %s(N = %d)', str, names(sog)[length(sog)], length(sog[[length(sog)]]))
+    return(str)
+  }
+}
+```
+
+There are accessibility quantification of total `r printNum(nrow(inputData))` `r feature`s for `r printNum(ncol(inputData) - dataStartCol + 1)` samples in the input data file (i.e., "*readCountFile*"). The samples are: `r printNames(names(inputData)[dataStartCol:ncol(inputData)])`. There are `r printNum(length(sampUse))` samples found in the given "*sampGrpSpecFile*". Only these samples (, which may be a subset of those in the quantification data file) will be included in the subsequent analysis and are: `r printNames(sampUse)`. There are `r printNum(length(sampOfGrp))` way`r if(length(sampOfGrp) > 1) {'s'}` of sample grouping found in the "*sampGrpSpecFile*". `r printSampGrpDetail()`. 
+
+## Data filtering
+```{r mincnt-filter}
+dataUse <- inputData[, c(idCol, dataStartCol:ncol(inputData))] # extract data for analysis
+# retain only samples included in the sample grouping file for analysis
+dataUse <- dataUse[, c(1, match(sampUse, names(dataUse)))] 
+
+# remove features that have 0 count at all samples
+anyCnt <- apply(dataUse[, 2:ncol(dataUse)], 1, 
+     function(x){if(length(which(x == 0)) == length(x)) return(FALSE) else return(TRUE)})
+dataUse <- dataUse[anyCnt, ] 
+cnts <- as.matrix(dataUse[, 2:ncol(dataUse)])
+rownames(cnts) <- dataUse[, 1]
+mode(cnts) <- 'integer'
+
+keep <- rowSums(cnts) >= minCntForFeat 
+sampKeep <- colSums(cnts) >= minCntForSamp
+dataUse <- dataUse[keep, c(TRUE, sampKeep)]
+cnts <- cnts[keep, sampKeep]
+```
+
+There are `r printNum(length(which(!anyCnt)))` `r feature`s having no read count at all in any of the samples `r if (length(which(!anyCnt)) > 0){', which are excluded from further analysis'}`. There are `r printNum(length(which(!keep)))` `r feature`s with an aggregated read counts less than `r printNum(minCntForFeat)` across all samples. There are `r printNum(length(which(!sampKeep)))` samples with an aggregated read counts less than `r printNum(minCntForSamp)` across all `r feature`s. These `r feature`s and samples (if any) were excluded from the subsequent analysis. The total number of remaining `r feature`s and samples are `r printNum(nrow(dataUse))` and `r printNum(ncol(cnts))`, respectively. 
+
+```{r early-exit-1, results='asis'}
+earlyExit(cnts)
+```
+
+The pairwise Spearman correlation among all samples were computed and saved to *data/samp-scorr.csv* using read counts. Below is a plot of the calculated correlations (*samp-scorr-1.pdf*). 
+
+```{r samp-scorr, fig.height=6, fig.width=6.4, dev=c('png', 'pdf')}
+sCor <- cor(cnts, method = 'spearman') # compute Spearman density among samples
+write.csv(sCor, file = paste0(outDataDir, '/sample-scorr.csv'),
+          row.names = TRUE, quote = FALSE)
+
+plotSCor <- function(corr){
+  #corr <- round(corr, 2)
+  corrplot(corr,
+           method = "square", type = "upper", 
+           order = "hclust", hclust.method = "complete",
+           tl.pos = "lt", diag = TRUE)
+
+  if (nrow(corr) < 12){
+    corrplot(corr,
+             method="number", type="lower", add = TRUE,  # add-on to previous plot
+             order= "hclust", hclust.method = "complete",
+             tl.pos = "n", diag = FALSE, cl.pos = "n")
+  }else{
+    corrplot(corr,
+             method="pie", type="lower", add = TRUE,  # add-on to previous plot
+             order = "hclust", hclust.method = "complete",
+             tl.pos="n", diag = FALSE, cl.pos = "n")
+  }
+}
+
+plotSCor(sCor)
+```
+
+The following is the density plot of the Spearman correlation of each sample to its nearest sample (*sample-scor-dens-1.pdf*). The density is evaluated by grouping samples according to the first way of sample grouping found in the input "*sampGrpSpecFile*".  
+
+```{r sample-scor-dens, fig.height=5, fig.width=7, dev=c('png', 'pdf')}
+diag(sCor) <- 0
+maxSCor <- apply(sCor, 1, function(x) max(x))
+
+plotSCorDens <- function(coor, grpClr = NULL) {
+  grp <- factor(getSampGrp(names(coor)), levels = getGrps())
+  df <- data.frame(cor = coor, grp = grp)
+  p <- ggplot(df, aes(x = cor, colour = grp)) + 
+    stat_density(adjust = 2, size = 1, geom = 'line', position = 'identity') +
+    theme_classic() + 
+    # scale_colour_manual(name = '', values = getStageColor()) + 
+    theme(legend.title = element_blank(), legend.text = element_text(size = 12),
+          axis.text.x = element_text(size = 12), axis.text.y = element_blank(),
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(title = '', x = 'Spearman correlation to nearest sample', y = 'Number of samples density')
+  
+  if (!is.null(grpClr)) {
+    p <- p + scale_colour_manual(name = '', values = grpClr)
+  }
+  
+  return(p)
+}
+plotSCorDens(maxSCor, sampGrpClr)
+```
+
+```{r scor-filter}
+sampKeep <- maxSCor >= minSampSCorr
+dataUse <- dataUse[, c(TRUE, sampKeep), drop = FALSE]
+cnts <- cnts[, sampKeep]
+
+sumSCorFlt <- function(keep) {
+  if (all(keep)) {
+    return(sprintf(paste0('All samples have a Spearman correlation to their nearest',
+            ' sample (determined by Spearman correlation) no less the minimum',
+            ' cutoff: %.3f'), minSampSCorr))
+  } else {
+    return(sprintf(paste0('There are %s samples with a Spearman correlation to their nearest',
+            ' sample (determined by Spearman correlation) less the minimum',
+            ' cutoff: %.3f, which are: %s. These samples were excluded from the subsequent anlaysis', 
+            ' After this step, there were %d samples remained in the analysis.'), 
+            printNum(length(which(!keep))), minSampSCorr, printNames(names(keep)[!keep]), ncol(dataUse) - 1))
+  }
+}
+```
+
+`r sumSCorFlt(sampKeep)`.
+
+```{r early-exit-2, results='asis'}
+earlyExit(cnts)
+```
+
+```{r mintpm-filter}
+# calculate TPM
+put('Calculating TPM ...', console = FALSE)
+
+if (feature == 'gene promoter') {
+  featLen <- sapply(rownames(cnts), function(feat) {
+    intvs <- featBed[featBed[, featBedIdCol] == feat, c(startCoorCol, endCoorCol)]
+    if (nrow(intvs) == 0) stop(sprintf('Feature: %s cannot be found in the feature bed file', feat))
+    else if (nrow(intvs) == 1) {
+      return(intvs[1, 2] - intvs[1, 1])
+    } else {
+      # multiple promoters
+      # sort according to start
+      intvs <- intvs[sort(intvs[, 1], index.return = TRUE)$ix, ]
+      featLen <- intvs[1, 2] - intvs[1, 1]
+      curEnd <- intvs[1, 2]
+      for (i in 2:nrow(intvs)) {
+        if (intvs[i, 2] > curEnd) {
+          featLen <- featLen + intvs[i, 2] - max(curEnd, intvs[i, 1])
+          curEnd <- intvs[i, 2]
+        }
+      }
+      return(featLen)
+    }
+  })
+} else {
+  coor <- inputData[match(dataUse[, 1], inputData[, idCol]), c(startCoorCol, endCoorCol)]
+  featLen <- coor[, 2] - coor[, 1]
+}
+
+tpm <- calculateTPM(cnts, featLen)
+tpmOut <- cbind(inputData[match(dataUse[, 1], inputData[, idCol]), c(idCol, annCols)], tpm)
+write.csv(tpmOut, paste0(outDataDir, '/tpm.csv'), row.names = FALSE, quote = FALSE)
+
+# filter based on tpm
+keep <- apply(tpm, 1, 
+            function(x){if(length(which(x >= minAcc)) < minNSamp) return(FALSE) else return(TRUE)})
+dataUse <- dataUse[keep, ]
+cnts <- cnts[keep, ]
+tpm <- tpm[keep, ]
+
+# save the data for future use
+write.csv(cbind(inputData[match(dataUse[, 1], inputData[, idCol]), c(idCol, annCols)], dataUse[, 2:ncol(dataUse)]), 
+          file = paste0(outDataDir, '/data-used.csv'),
+          row.names = FALSE, quote = FALSE)
+```
+
+The accessibility quantification in TPM of each `r feature` in all samples was calculated and saved to *data/tpm.csv*. There are `r printNum(length(which(!keep)))` `r feature`s with an accessibility quantification level (in TPM) over `r minAcc` in less than `r printNum(minNSamp)` sample(s). These `r feature`s (if any) were excluded from the subsequent analysis. The total number of `r feature`s remained in the analysis is `r printNum(nrow(dataUse))`. These `r feature`s together with their read counts in all samples were saved to *data/data-used.csv*. 
+
+```{r early-exit-3, results='asis'}
+earlyExit(cnts)
+```
+
+The following is a box plot of read counts per `r feature` in all samples after filtering (*feat-rcnt-1.pdf*). 
+
+```{r feat-rcnt, fig.height=4, fig.width=7, dev=c('png','pdf')}
+libSizeBPlot <- function(cnts, grpClr = NULL) {
+  logCnt <- log10(cnts + 1)
+  df <- NULL
+  samps <- colnames(cnts)
+  grps <- getSampGrp(samps)
+  for (iS in 1:length(samps)) {
+    df <- rbind(df, data.frame(cnt = logCnt[, iS], 
+                               samp = rep(samps[iS], nrow(logCnt)), 
+                               grp = rep(grps[iS], nrow(logCnt))))
+  }
+  
+  df$grp <- factor(df$grp, levels = getGrps())
+  p <- ggplot(data = df, aes(x= samp, y = cnt, fill = grp)) +
+    geom_boxplot() + 
+    theme_classic() +
+    labs(y = expression(Log[10]~"counts")) +
+    theme(axis.text = element_text(size = 12), axis.title = element_text(size = 12),
+          axis.title.x = element_blank(), legend.title = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.5, hjust = 1)) +
+    scale_x_discrete(limits = samps)
+  if (!is.null(grpClr)) {
+    p <- p + scale_fill_manual(name = '', values = grpClr)
+  }
+  
+  return(p)
+}
+libSizeBPlot(cnts, sampGrpClr)
+```
+
+The number of accessible `r feature`s was counted for each sample and saved to *data/num-of-afeat.csv*. A `r feature` with an accessible quantification no less than `r minAcc` in a sample is considered as accessible in that sample. Below is a bar plot of the number of accessible `r feature`s in all samples (*num-efeat-bar-1.pdf*).   
+
+```{r 'num-efeat-bar', fig.height=3, fig.width=7, dev=c('png', 'pdf')}
+nAFeat <- apply(tpm, 2, function(x) length(which(x >= minAcc)))
+write.csv(data.frame(Samp = names(nAFeat), Count = nAFeat),
+          paste0(outDataDir, '/num-of-afeat.csv'),
+          row.names = FALSE, quote = FALSE)
+
+plotNAFeatBar <- function(nums, grpClr = NULL) {
+  grps <- factor(getSampGrp(names(nums)), levels = getGrps())
+  df <- data.frame(num = nums, samp = names(nums), grp = grps)
+  p <- ggplot(df, aes(x = samp, y = num, fill = grp)) + 
+    geom_bar(stat = "identity") + theme_classic() + 
+    theme(axis.text = element_text(size = 12), axis.title = element_text(size = 12),
+          axis.title.x = element_blank(), legend.title = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.5, hjust = 1)) +
+    scale_x_discrete(limits = names(nums)) +
+    # scale_y_continuous(breaks = c(5000, 7500, 10000, 12500)) + 
+    labs(title = '', x = '', y = sprintf('Number of accessible %ss', feature))
+  if (!is.null(grpClr)) {
+    p <- p + scale_fill_manual(name = '', values = grpClr)
+  }
+  return(p)
+}
+
+plotNAFeatBar(nAFeat, sampGrpClr)
+```
+
+The following is the density plot of the number of accessible `r feature`s per sample (*num-efeat-dens-1.pdf*). The estimation of the density was done by grouping samples according to the first way of sample grouping found in the input "*sampGrpSpecFile*".
+
+```{r 'num-efeat-dens', fig.height=5, fig.width=7,dev=c('png', 'pdf')}
+plotNAFeatDens <- function(nums, grpClr = NULL) {
+  grp <- factor(getSampGrp(names(nums)), levels = getGrps())
+  df <- data.frame(num = nums, grp = grp)
+  p <- ggplot(df, aes(x = num, colour = grp)) + 
+    stat_density(adjust = 2, size = 1, geom = 'line', position = 'identity') +
+    theme_classic() + 
+    theme(legend.title = element_blank(), legend.text = element_text(size = 12),
+          axis.text.x = element_text(size = 12), axis.text.y = element_blank(),
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(title = '', x = sprintf('Number of accessible %ss per sample', feature), 
+         y = 'Number of samples density')
+  if (!is.null(grpClr)) {
+    p <- p + scale_colour_manual(name = '', values = grpClr)
+  }
+  return(p)
+}
+
+plotNAFeatDens(nAFeat, sampGrpClr)
+```
+
+## Pairwise sample Poisson distance 
+Pairwise sample distance was estimated using read counts based on Poisson distance introduced in [@witten2011] and saved to *data/samp-poss-dist.csv*. Below is a Heatmap plot of this distance matrix (*samp-poss-dist-1.pdf*).
+
+```{r samp-poss-dist, fig.height=6, fig.width=6.6, dev=c('png', 'pdf')}
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pDist <- PoissonDistance(t(cnts))
+pDistMat <- as.matrix(pDist$dd ) 
+rownames(pDistMat) <- colnames(cnts)
+colnames(pDistMat) <- colnames(cnts) 
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+write.csv(pDistMat, paste0(outDataDir, '/samp-poss-dist.csv'), 
+          row.names = TRUE, quote = FALSE)
+pheatmap(pDistMat,
+         clustering_distance_rows = pDist$dd,
+         clustering_distance_cols = pDist$dd,
+         col = colors, 
+         clustering_method = 'complete',
+         legend = TRUE)
+```
+
+## Pearson correlation
+The Pearson correlation between each pair of samples was calculated using TPM data and saved to *data/samp-pcorr.csv*. The following is the heatmap to show the calculated correlations (*samp-pcorr-1.pdf*). 
+
+```{r samp-pcorr, fig.height=6, fig.width=6, dev=c('png','pdf')}
+pCorr <- cor(tpm, method = 'pearson')
+
+plotPCorr <- function(corr) {
+  pheatmap(corr, cluster_rows = TRUE, cluster_cols = TRUE, display_numbers = FALSE)
+}
+
+write.csv(pCorr, file = paste0(outDataDir, '/samp-pcorr.csv'), quote = FALSE)
+plotPCorr(pCorr)
+```
+
+
+## Data normalization
+
+```{r deseq2-norm, message=FALSE}
+sampInfo <- sampGrpSpec[match(colnames(cnts), sampGrpSpec[, 1]), ]
+batch <- factor(sampInfo[, 2])
+group1 <- factor(sampInfo[, sampGrpStartCol])
+if (length(sampOfGrp) > 1) {
+  group2 <- factor(sampInfo[, sampGrpStartCol + 1])
+  coldata <- data.frame(row.names = colnames(cnts), 
+                      samp = colnames(cnts),
+                      batch = batch,
+                      group1 = group1,
+                      group2 = group2)
+} else {
+  coldata <- data.frame(row.names = colnames(cnts), 
+                      samp = colnames(cnts),
+                      batch = batch,
+                      group1 = group1)
+}
+
+if (length(levels(batch)) > 1){
+  if (length(sampOfGrp) > 1) {
+    desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group1 + group2 + batch)
+  } else {
+    desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group1 + batch)
+  }
+  
+} else {
+  if (length(sampOfGrp) > 1) {
+    desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group1 + group2)
+  } else {
+    desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group1)
+  }
+}
+# the above rich colData and design input may not be necessary for just obtaining 
+# the normalized read counts, only important when subsequent differential analysis is needed
+desObj <- DESeq(desData)
+normCnts <- counts(desObj, normalized = TRUE)
+normCntsOut <- cbind(inputData[match(rownames(normCnts), inputData[, idCol]), c(idCol, annCols)], normCnts)
+write.csv(normCntsOut, paste0(outDataDir, '/normalized-counts.csv'), 
+          row.names = FALSE, quote = FALSE)
+```
+
+The raw read counts were normalized by running DESeq2. The normalized read counts were saved to *data/normalized-counts.csv*. The histograms of read counts before and after normalization are in below (*cnt-hist-1.pdf*). 
+
+```{r cnt-hist, fig.height=4, fig.width=10, dev=c('png', 'pdf')}
+plotLogOfCnt <- function(cnts, title) {
+  df <- data.frame(cnt = log10(c(cnts + 1)))
+  p <- ggplot(df, aes(x = cnt)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) +
+    theme_classic() + ggtitle(title) +
+    theme(axis.text.x = element_text(size = 12), 
+          plot.title = element_text(margin = margin(t = 10, b = -20, l = 50, r = 50),
+                                    hjust = 0.5),
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = expression(Log[10]~'(count + 1)'), y = 'Frequency') +
+    scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5)) 
+  return(p)
+}
+
+grobs <- list()
+grobs[[1]] <- plotLogOfCnt(counts(desObj), 'Raw counts')
+grobs[[2]] <- plotLogOfCnt(counts(desObj, normalized = TRUE), 'Normalized counts') +
+   theme(axis.title.y = element_blank())
+grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+```
+
+Below is the CV (coefficient of variation) plot of per-`r feature` normalized read count, i.e., CV plotted against the mean count of each `r feature` over all samples (*cnt-cv-1.pdf*). 
+
+```{r cnt-cv, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotDispEsts(desObj, CV = TRUE,
+             xlab = 'Mean of normalized counts',
+             ylab = 'Coefficient of variation')
+```
+
+## Sample PCA plot
+
+The following are two plots of samples embedded in the two-dimensional space spanned by the first two principle components from the PCA analysis of the transformed count data based on variance stabilizing transformation (VST) [@Anders2010] (*samp-pca-nlbl-1.pdf* and *samp-pca-lbl-1.pdf*). The two plots are identical, except that sample names are shown in the second one. The transformed count data can be found in *data/vst-counts.csv*. The PC coordinates of all samples (used in the plot) were saved to *data/pca-embed.csv*.
+
+```{r samp-pca-nlbl, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+vstObj <- varianceStabilizingTransformation(desObj) 
+vstCnts <- assay(vstObj)
+vstCntsOut <- cbind(inputData[match(rownames(vstCnts), inputData[, idCol]), c(idCol, annCols)], vstCnts)
+write.csv(vstCntsOut, paste0(outDataDir, '/vst-counts.csv'), 
+          row.names = FALSE, quote = FALSE)
+
+if ('group2' %in% names(colData(desObj))) {
+  pcaData <- plotPCA(vstObj, intgroup = c('group1',  'group2'), returnData = TRUE)
+} else {
+  pcaData <- plotPCA(vstObj, intgroup = 'group1', returnData = TRUE)
+}
+write.csv(pcaData, paste0(outDataDir, '/pca-embed.csv'), 
+          row.names = FALSE, quote = FALSE)
+
+plotPca <- function(pcaData, percOfVar, sampLabel = FALSE, grpClr = NULL) {
+  if ('group2' %in% colnames(pcaData)) {
+    p <- ggplot(pcaData, aes(PC1, PC2, color = group1, shape = group2))
+  } else {
+    p <- ggplot(pcaData, aes(PC1, PC2, color = group1))
+  }
+  if (!is.null(grpClr)) {
+    p <- p + scale_colour_manual(name = '', values = grpClr)
+  }
+  p <- p + geom_point(size = 3) +
+    xlab(paste0("PC1: ", percOfVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percOfVar[2], "% variance"))
+  if (sampLabel) {
+    p <- p + geom_label_repel(aes(label = rownames(pcaData)),
+                      box.padding = 0.35,
+                      point.padding = 1,
+                      segment.color = 'grey50',
+                     segment.alpha = 0.5,
+                      show.legend = FALSE) # if TRUE, legend display might not be correct
+  }
+   p <- p + theme_classic() + 
+     theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14),
+        legend.position = 'right', legend.title = element_blank())
+   return(p)
+}
+
+pcaData$group1 <- factor(pcaData$group1, levels = getGrps())
+plotPca(pcaData, round(100 * attr(pcaData, 'percentVar'), 1), grpClr = sampGrpClr)
+```
+
+```{r samp-pca-lbl, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotPca(pcaData, round(100 * attr(pcaData, 'percentVar'), 1), sampLabel = TRUE, grpClr = sampGrpClr)
+```
+
+
+```{r 'samp-corr-pcs'}
+nPc <- min(10, ncol(pCorr))
+pcaObj <- prcomp(pCorr, rank. = nPc, scale. = TRUE)
+varExp <- pcaObj$sdev[1:min(nPc, ncol(pCorr))] ^ 2
+varExp <- varExp * 100 / sum(varExp)
+write.csv(data.frame(pc = paste0('PC', 1:nPc), var = varExp), 
+          paste0(outDataDir, '/samp-corr-pc-var.csv'), row.names = FALSE, 
+          quote = FALSE)
+```
+
+PCA was also done on the Pearson correlation matrix among samples. Below is a plot (*samp-corr-pc-var-1.pdf*) that shows the amount of variance in the data explained by each of the top `r printNum(nPc)` PCs. The data used in the plot (percentage of variance explained by each PC) were saved to *data/samp-corr-pc-var.csv*.
+
+```{r 'samp-corr-pc-var', fig.height=4, fig.width=6, dev=c('png','pdf')}
+fviz_eig(pcaObj, main = '') # plot PCs
+```
+
+The two figures below show the distribution of the samples in the two-dimensional space spanned by the first two PCs. The two figures plots the exact same day with the first one (*samp-corr-pca-nlbl-1.pdf*) having no show of sample labels and the second one (*samp-corr-pca-lbl-1.pdf*) having. The plotting data (i.e., the embeddings) were saved to *data/corr-pca-embed.csv*. 
+
+```{r 'samp-corr-pca-nlbl', fig.width=4, fig.width=6, dev=c('png', 'pdf')}
+corPcaData <- cbind(pcaObj$rotation[match(rownames(pcaData), rownames(pcaObj$rotation)), 1:2], 
+                    pcaData[, 3:ncol(pcaData)])
+rownames(corPcaData) <- rownames(pcaData)
+write.csv(corPcaData, paste0(outDataDir, '/corr-pca-embed.csv'), 
+          row.names = FALSE, quote = FALSE)
+
+plotPca(corPcaData, round(varExp[1:2], 1), grpClr = sampGrpClr)
+```
+
+```{r 'samp-corr-pca-lbl', fig.width=6, fig.width=6, dev=c('png', 'pdf')}
+plotPca(corPcaData, round(varExp[1:2], 1), sampLabel = TRUE, grpClr = sampGrpClr)
+```
+
+## t-SNE
+
+Below are two t-SNE plots of all samples, in which the embedding was computed using the same transformed count data as in above PCA plots (*tsne-nlbl-1.pdf* and *tsne-lbl-1.pdf*). The two plots are identical, except that sample names are shown in the second one. The embedding for all samples can be found in *data/tsne-embedding.csv*.
+
+```{r 'tsne-nlbl', fig.width=5, fig.width=6, dev=c('png', 'pdf')}
+tSneObj <- Rtsne(t(vstCnts), initial_dims = 30, perplexity = tsnePerplexity, pca_scale = TRUE, theta = 0.0, 
+                 max_iter = 2000, Y_init = pcaData[, 1:2] / -20) # use scaled (by factor 20) first two PCs
+tSneCoor <- tSneObj$Y
+rownames(tSneCoor) <- colnames(vstCnts)
+colnames(tSneCoor) <- c('tSNE_1', 'tSNE_2')
+write.csv(tSneCoor, paste0(outDataDir, '/tsne-embedding.csv'), 
+          row.names = TRUE, quote = FALSE)
+
+plotTSne <- function(coors, group1, group2 = NULL, sampLabel = FALSE, grpClr = NULL) {
+  if (is.null(group2)) {
+    df <- data.frame(coors, group1 = group1)
+    p <- ggplot(df, aes(tSNE_1, tSNE_2, color = group1))
+  } else {
+    df <- data.frame(coors, group1 = group1, group2 = group2)
+    p <- ggplot(df, aes(tSNE_1, tSNE_2, color = group1, shape = group2))
+  }
+  if (!is.null(grpClr)) {
+    p <- p + scale_colour_manual(name = '', values = grpClr)
+  }
+  p <- p + geom_point(size = 3) +
+    xlab('tSNE_1') + ylab('tSNE_2')
+  if (sampLabel) {
+    p <- p + geom_label_repel(aes(label = rownames(pcaData)),
+                      box.padding = 0.35,
+                      point.padding = 1,
+                      segment.color = 'grey50',
+                      segment.alpha = 0.5,
+                      show.legend = FALSE) # if TRUE, legend display might not be correct
+  }
+   p <- p + theme_classic() + 
+     theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14),
+        legend.position = 'right', legend.title = element_blank())
+   return(p)
+}
+
+if ('group2' %in% names(pcaData)) {
+  plotTSne(tSneCoor, pcaData$group1, pcaData$group2, grpClr = sampGrpClr)
+} else {
+  plotTSne(tSneCoor, pcaData$group1, grpClr = sampGrpClr)
+}
+```
+
+```{r 'tsne-lbl', fig.width=5, fig.width=6, dev=c('png', 'pdf')}
+if ('group2' %in% names(pcaData)) {
+  plotTSne(tSneCoor, pcaData$group1, pcaData$group2, sampLabel = TRUE, grpClr = sampGrpClr)
+} else {
+  plotTSne(tSneCoor, pcaData$group1, sampLabel = TRUE, grpClr = sampGrpClr)
+}
+```
+
+## References
+
+```{r 'end-doc'}
+log_close()
+```
+
+
+

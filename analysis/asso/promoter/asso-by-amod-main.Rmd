@@ -1,0 +1,25 @@
+### Co-accessible promoters
+
+This subsection studies the expression of `r feature`s whose promoters were identified to be co-accessible in promoter accessibility analysis. Analysis was not done for modules with a maximum correlation (with group specific accessibility pattern) less than `r sprintf('%.3f', minAModCor)`.
+
+```{r exp-coa}
+load(cAccModFile)
+accMod <- module
+rm(module)
+
+aModOutDir <- paste0(output, '/acc-mod')
+if (!dir.exists(aModOutDir)) dir.create(aModOutDir)
+
+out <- NULL
+# for each module, show heatmap and correlation histogram
+for (modId in names(accMod$moduleNames)) {
+  if (max(accMod$modGrpCor$cor[accMod$moduleNames[modId], ]) < minAModCor) {
+    # if the max correlation associated with this module is less than the given 
+    # threshold, no analysis
+    next
+  }
+  out <- c(out, knitr::knit_expand(file = file.path(knitr::opts_knit$get("output.dir"), "promoter", "asso-by-amod.Rmd")))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`

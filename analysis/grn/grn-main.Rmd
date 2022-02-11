@@ -1,0 +1,796 @@
+---
+title: "`r params$title`"
+author: "`r params$author`"
+date: "`r params$date`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+params:
+  title: Gene Regulatory Network Reconstruction
+  author: Javon
+  date: Feb 27, 2021
+  tfTool: tobias
+  motOccAtPk: NULL
+  motStartCol: 23
+  motGeneMap: NULL
+  uscsToEnsmMap: NULL
+  tfToInc: NULL
+  binDetectDir: NULL
+  species: NULL
+  promBed: NULL
+  geneAnn: NULL
+  expCnt: NULL
+  expIdCol: 1
+  expNameCol: 5
+  expAnnCols: 2;3;4;5
+  expDataSCol: 6
+  expChrCol: 2
+  expSCoorCol: 3
+  expECoorCol: 4
+  expSampGrpSpec: NULL
+  expLfc: NULL
+  peaks: NULL
+  peakAcc: NULL
+  feature: gene
+  deComp: NULL
+  deRes: NULL
+  deMeta: NULL
+  output: NULL
+  logFile: NULL
+  promLeftExt: 500
+  promRightExt: 500
+  regExt: 100
+  coeMode: single-gene
+  minCor: 0.85
+  minAEC: 0.8
+  nTopDe: 500
+  tfSet: NULL
+---
+
+<!--
+NOTES:
+1. The tf-bind-score.csv (if exists) in the data folder contains aggregated TF binding scores from running TOBIAS. It is time consuming to aggregate the scores. To save time in subsequent runs, the aggregated scores is saved to this file during the first time of running. In subsequent runs, if this file exists, aggregated scores will be directly loaded from this file. In the case of detection results from running TOBIAS are changed, this file should be manually deleted, so the new results will be processed. 
+-->
+
+<!-- 
+Input parameters:
+
+tfTool - indicate the tool used in TF binding finding, can be 'homer', 'tobias'.  
+  If 'homer', the following parameters are requried: motOccAtPk, motGeneMap, and 
+  uscsToEnsmMap. if 'tobias', binDetectDir is mandatory
+  
+binDetectDir - the path to the directory that holds the results from running TOBIAS BINDetect
+
+tfToInc - optional, path to a jaspar file that provides TF to include in the analysis
+
+expCnt - expression quantification, this program currently only works with gene level
+  expression quantification. The expression quantification is assumed to be normalized 
+  against the library size.
+  
+expLfc - optional, path to file that provides calculated log fold change from pairwise comparisons.
+  The first column of this files is expected to contain the gene_id, and each of all the rest of 
+  columns provides the log of fold change from one comparison
+  
+deRes - optional, can be a path to either a single file that provides DE test results or a folder that 
+  contains a set of files with each providing test results from one comparison. If not provided, GRN considering
+  only DE gene will not be done.
+  If the path is to a folder, inputs deComp and deMeta are required
+  If the path is to a file, this file is expected to contain two columns, with first column providing 
+  gene id and second column providing the tested pvalue.
+  
+peaks - path to peak file
+
+peakAcc - path to peak accessibility file
+
+minAEC - minimum accessibility-expression correlation used in the prediction of enhancer
+
+promLeftExt - number of base pairs to include from the left side of the TSS in derivation of promoter, default 500
+
+promRightExt - number of base pairs to include from the right side of the TSS in derivation of promoter, default 500
+
+coeMode - the mode to compute gene co-expression, can be either "single-gene", or "group-average" of 
+  expression, or "lfc", log fold change from pairwise comparisons, single-gene by default. 
+  if group-average, input expSampGrpSpec is required
+  if lfc, input expLfc is required
+--> 
+
+```{r set-up, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+rLib <- Sys.getenv(c('R_LIB_J'))
+
+inputParams <- params
+# set up for testing
+test = T
+if (test) {
+  anaDir <- '/scratch-lustre/ml-csm/projects/tissue-regen/analysis/fat-mm/ana-101721/wt+ko/w3'
+  refDir <- '/scratch-lustre/ml-csm/datasets/genomics/ref-genome/mouse'
+  inputParams$species <- 'mouse'
+  
+  if (inputParams$tfTool == 'homer') {
+    motifDir <- paste0(anaDir, '/atac/data/peakar/mrgd-peaks/motif')
+    inputParams$motOccAtPk <- paste(paste0(motifDir, c('/promoter/pos-strd/data/all', 
+                                           '/distal/pos-strd/data/all'), 
+                               '/motif.location.txt'), 
+                        collapse = ';')
+    inputParams$motGeneMap <- paste0(refDir, '/homer/motif-gene-match.txt')
+    inputParams$uscsToEnsmMap <- paste0(refDir, '/GRCm38/ucsc/annotations/ucsc2ensembl.map')
+  } else if (inputParams$tfTool == 'tobias') {
+    inputParams$binDetectDir <- paste0(anaDir, '/atac/data/peakar/mrgd-peaks/tf-bind/BINDetect/data')
+    inputParams$tfToInc <- '/scratch-lustre/ml-csm/datasets/genomics/motif/jaspar/2022/CORE_vertebrates_non-redundant.jaspar'
+  } else {
+    stop(sprintf('Unrecognized TF binding detection tool: %s', inputParams$tfTool))
+  }
+  
+  # annotation
+  inputParams$promBed <- paste0(refDir, '/GRCm38/ensembl/annotations/prom.bed')
+  inputParams$geneAnn <- paste0(refDir, '/GRCm38/ensembl/annotations/gene.bed')
+  
+  # gene expression
+  # inputParams$expCnt <- paste0(anaDir, '/rna/analysis/results/data/normalized-counts.csv')
+  inputParams$expCnt <- '/scratch-lustre/ml-csm/projects/tissue-regen/analysis/fat-mm/ana-081821/rna//wt+ko-1/data/expr/tpm.gene.csv'
+  inputParams$expSampGrpSpec <- paste0(anaDir, '/grn/data/samp-grp-batch.csv')
+  inputParams$coeMode <- 'lfc'
+  inputParams$expLfc <- paste0(anaDir, '/grn/data/exp-lfc.csv')
+  # peaks
+  inputParams$peaks <- paste0(anaDir, '/atac/data/peakar/mrgd-peaks/peaks/data/all/all.peaks')
+  inputParams$peakAcc <- paste0(anaDir, '/atac/data/peakar/pk-qtf/data/no-grp/fpkm.csv')
+  
+  # DE
+  # inputParams$deComp <- paste0(anaDir, '/rna/de/comparisons.csv')
+  # inputParams$deRes <- paste0(anaDir, '/rna/de/results/gene/de-tests')
+  # inputParams$deMeta <- paste0(anaDir, '/grn/de-meta.txt')
+  inputParams$deRes <- paste0(anaDir, '/grn/data/de-test.csv')
+  
+  
+  # output
+  inputParams$output <- paste0(anaDir, '/grn/results')
+  inputParams$logFile <- paste0(anaDir, '/grn/run-log/grn.log')
+  
+  # include only pregiven TFS
+  # tfSet <- 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/ana-030421/grn/tf-set.txt'
+}
+```
+
+```{r valid-input, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+if (inputParams$tfTool == 'homer') {
+  if (is.null(inputParams$motOccAtPk)) stop('Parameter motOccAtPk is required')
+  if (is.null(inputParams$motGeneMap)) stop('Parameter motGeneMap is required')
+  if (is.null(inputParams$uscsToEnsmMap)) stop('Parameter uscsToEnsmMap is required')
+} else if (inputParams$tfTool == 'tobias') {
+  if (is.null(inputParams$binDetectDir)) stop('Parameter binDetectDir is required')
+} else {
+  stop(sprintf('Unrecognized TF binding detection tool: %s', inputParams$tfTool))
+}
+if (is.null(inputParams$species)) stop('Parameter species is required')
+if (is.null(inputParams$promBed)) stop('Parameter promBed is required')
+if (is.null(inputParams$geneAnn)) stop('Parameter geneAnn is required')
+if (is.null(inputParams$expCnt)) stop('Parameter expCnt is required')
+if (is.null(inputParams$output)) stop('Parameter output (specifying the output directory) is required')
+if (is.null(inputParams$logFile)) stop('Parameter logFile is required')
+
+if (inputParams$coeMode == 'group-average' && is.null(inputParams$expSampGrpSpec)) {
+  stop('Parameter expSampGrpSpec is required to identify gene co-expression using group average.')
+}
+if (inputParams$coeMode == 'lfc' && is.null(inputParams$expLfc)) {
+  stop('Parameter expLfc is required to identify gene co-expression using lfc.')
+}
+```
+
+```{r init, echo=FALSE, message=FALSE, warning=FALSE, results='hide'}
+library(knitr)
+library(Cairo)
+library(pheatmap)
+library(grid)
+library(logr)
+library(stringr)
+library(ggplot2)
+library(gg.gap)
+library(magrittr)
+library(ggpubr)
+library(gridExtra)
+library(grid)
+
+source(sprintf('%s/packages/utils/R/motif.R', rLib))
+source(sprintf('%s/packages/utils/R/convMatIdx1to2.R', rLib))
+
+# The following setting is important, do not omit.
+options(stringsAsFactors = FALSE);
+
+##### Parameters related to input data ####
+# control the format of the gene symbol in the output
+species <- inputParams$species
+
+# promoter bed file
+promBedFile <- inputParams$promBed
+geneAnnFile <- inputParams$geneAnn 
+
+# expression quantification
+expCntFile <- inputParams$expCnt
+expIdCol <- inputParams$expIdCol
+expNameCol <- inputParams$expNameCol
+
+# peaks and quantification
+peakFile <- inputParams$peaks
+peakAccFile <- inputParams$peakAcc
+
+# annotation columns, it is assumed gene_symbol is among the annotations, which is 
+# required for matching genes in motif analysis
+if (!is.null(inputParams$expAnnCols) && !is.integer(inputParams$expAnnCols)) {
+  expAnnCols <- as.integer(strsplit(inputParams$expAnnCols, ';')[[1]])
+}
+
+expDataSCol <- inputParams$expDataSCol
+expChrCol <- inputParams$expChrCol
+expSCoorCol <- inputParams$expSCoorCol
+expECoorCol <- inputParams$expECoorCol
+feature <- inputParams$feature
+
+# DE specification and results
+deGrn <- FALSE
+if (!is.null(inputParams$deRes)) {
+  if (file_test('-d', inputParams$deRes)) {
+    deCompFile <- inputParams$deComp
+    deResDir <- inputParams$deRes
+    deMetaFile <- inputParams$deMeta
+  }
+  
+  deGrn <- TRUE
+}
+###########################################
+
+#### Parameters related to output ####
+outDir <- inputParams$output
+logFile <- inputParams$logFile
+###########################################
+
+#### Parameters to adjust for the analysis ####
+# number of base pairs to include from the left side of the TSS in derivision of promoter
+promLeftExt <- inputParams$promLeftExt
+# number of base pairs to include from the right side of the TSS in derivision of promoter
+promRightExt <- inputParams$promRightExt
+# regulatory extension, based on which regulatory region will be defined for each gene
+# as a region centered at TSS, extending to both up and down-stream within the given
+# regulatory extension
+regExt <- inputParams$regExt * 1000
+# the minimum correlation to consider co-express
+minCor <- inputParams$minCor
+# the number of top DE features included in the network analysis
+nTopDe <- inputParams$nTopDe 
+# TFs inlcuded in GRN
+tfSetFile <- inputParams$tfSet
+# minimum accessibility-expression correlation used in the prediction of enhancer
+minAEC <- inputParams$minAEC
+###########################################
+
+# set up output folders
+outDataDir <- paste0(outDir, '/data')
+if (!dir.exists(outDataDir)) dir.create(outDataDir)
+figDir <- paste0(outDir, '/figures')
+if (!dir.exists(figDir)) dir.create(figDir)
+
+# set up log
+if (is.null(logFile)) {
+  logFile <- file.path(tempdir(), "grn.log")
+}
+logger <- log_open(logFile, logdir = FALSE)
+options("logr.notes" = FALSE)
+
+# log passed in running parameters
+put("Input parameters: ", console = FALSE)
+put(paste("motOccAtPk=", inputParams$motOccAtPk), console = FALSE)
+put(paste("output=", inputParams$output), console = FALSE)
+
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+knitr::opts_chunk$set(dev.args = list(png = list(type = "cairo")))
+```
+
+
+```{r functions}
+# letter - indicates whether to print numbers below zero as English letters
+printNum <- function(number, letter = TRUE) {
+  if (number < 10 && letter) {
+    return(english(number))
+  } else {
+    return(prettyNum(number, big.mark = ','))
+  }
+}
+
+printNames <- function(nms) {
+  if (length(nms) == 1) {
+    return(nms)
+  }
+  str <- paste(nms[1:(length(nms) - 1)], collapse = ', ')
+  str <- sprintf('%s and %s', str, nms[length(nms)])
+  return(str)
+}
+
+addGapToHist <- function(p, nLowTicks = 5, nUpTicks = 1) {
+  binCnts <- ggplot_build(p)$data[[1]]$count
+  topTwo <- sort(binCnts, decreasing = TRUE)[1:2]
+  if (topTwo[2] > nLowTicks && topTwo[1] / 2 > topTwo[2]) {
+    tickWith <- floor(topTwo[2] / nLowTicks)
+    tickWith <- (as.numeric(substr(tickWith, 1, 1)) + 1) * (10 ^ (nchar(tickWith) - 1))
+    
+    segUp <- floor(topTwo[1] / tickWith) * tickWith
+    if (segUp == topTwo[1]) {
+      segUp <- segUp - tickWith
+      nUpTicks <- 2
+    }
+    
+    yUpLim <- ceiling(topTwo[1] / tickWith) * tickWith
+    
+    p <- gg.gap(p, ylim = c(0, yUpLim), 
+                segments = c(tickWith * nLowTicks, segUp),
+                tick_width = c(tickWith, tickWith), 
+                rel_heights = c(nLowTicks / (nLowTicks + nUpTicks), 0, nUpTicks / (nLowTicks + nUpTicks)),
+                margin = c(top = 0, right = 0, bottom = 0, left = 1))
+  }
+  return(p)
+}
+
+```
+
+## Define putative regulatory region of `r feature`
+
+```{r peaks, message=FALSE, results='hide'}
+# load gene expression data
+expCntFull <- read.csv(expCntFile)
+if (!is.null(inputParams$expLfc)) {
+  # load log folder change data if provided
+  expLfc <- read.csv(inputParams$expLfc)
+  # align the two datasets, retain only genes that appear in both
+  ovlGenes <- intersect(expCntFull[, expIdCol], expLfc[, 1])
+  expCntFull <- expCntFull[match(ovlGenes, expCntFull[, expIdCol]), ]
+  expLfc <- as.matrix(expLfc[match(ovlGenes, expLfc[, 1]), 2:ncol(expLfc)])
+  rownames(expLfc) <- ovlGenes
+  rm(ovlGenes)
+}
+
+if (species == 'mouse') {
+  expCntFull[, expNameCol] <- str_to_sentence(expCntFull[, expNameCol])
+} else {
+  expCntFull[, expNameCol] <- toupper(expCntFull[, expNameCol])
+}
+
+# load promoters
+prom <- read.table(promBedFile, sep = '\t', header = FALSE)
+# Note, here we assume all gene can be found in the prom
+# Exclude promoters of genes that are not included in expression file
+prom <- prom[prom$V4 %in% expCntFull[, expIdCol], ]
+# find TSS for each gene, which is the center of promoters annotated to the gene
+tss <- data.frame(chr = prom$V1, pos = prom$V2 + floor((prom$V3 - prom$V2) / 2), 
+                  gene = prom$V4)
+
+# retain only genes from known chromosomes
+if (species == 'mouse') {
+  knownChrs <- c(1:19, 'X', 'Y') 
+} else if (species == 'cow') {
+  knownChrs <- c(1:29, 'X', 'Y') 
+} else if (species == 'human') {
+  knownChrs <- c(1:22, 'X', 'Y') 
+} else {
+  stop(sprintf('Unsuported species: %s', species))
+}
+tss <- tss[tss$chr %in% knownChrs, ]
+
+# define regulatory region (RR)
+# the code below assumes TSSs are sorted in ascending order by coordinates, so sort to make sure
+tss <- tss[order(tss$pos), ]
+tss <- tss[order(tss$gene), ] # put TSSs from same gene together
+tss <- tss[order(tss$chr), ]
+
+rr <- tss
+rr <- rr[, c(3, 1, 2)]
+names(rr)[3] <- 'start'
+rr$start <- sapply(tss$pos - regExt, function(x) return(max(0, x))) # close
+rr <- cbind(rr, end = tss$pos + regExt + 1) # open
+# combine overlapping regions of same gene. Note that it is assumed that all TSSs
+# are sorted in ascending order according to their coordinates
+iLastAct <- 1
+toRm <- rep(FALSE, nrow(rr))
+for (iR in 2:nrow(rr)) {
+  if (rr$gene[iR] == rr$gene[iLastAct] # same gene
+      && rr$chr[iR] == rr$chr[iLastAct] # make sure the two regions on the same chromosome, just in case
+      && rr$start[iR] < rr$end[iLastAct]) { # overlaps
+    # merge by extend the end of last active region to the end of current region  
+    rr$end[iLastAct] <- rr$end[iR]
+    toRm[iR] <- TRUE # mark the current region to remove later
+  } else {
+    iLastAct <- iR
+  }
+}
+rr <- rr[!toRm, ] # remove redundant regions
+rrToSave <- cbind(gene_id= rr$gene, expCntFull[match(rr$gene, expCntFull[, expIdCol]), expAnnCols],
+                  rr_start = rr$start, rr_end = rr$end, length = rr$end - rr$start)
+write.csv(rrToSave, file = paste0(outDataDir, '/gene-rr.csv'), row.names = FALSE, quote = FALSE)
+```
+
+The putative regulatory region of `r feature`s were obtained by extending to both sides of TSS by `r regExt / 1000`kb. For `r feature`s that have multiple TSSs, overlapping regions were merged and non-overlapping regions were kept as individual records. Among the total of `r printNum(length(unique(rr$gene)))` `r feature`'s, there are `r length(which(!(rr$gene %in% unique(rr$gene[duplicated(rr$gene)]))))` with a single derived regulatory regions. The derived regulatory regions for all `r feature`'s were saved to *gene-rr.csv*. A histogram showing the distribution of the size of the regulatory regions is provided in below (*rr-hist-1.pdf*).
+
+```{r rr-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+df <- data.frame(size = (rr$end - rr$start) / 1000)
+# df$size[df$size > 400] <- 400
+p <- ggplot(df, aes(x = size)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = 'Size (in kb)', y = 'Frequency')
+addGapToHist(p)
+```
+
+## Identify enhancers of `r feature`s
+### Find peaks that overlap with the regulatory regions of `r feature`s
+
+```{r load-peaks}
+# load peaks
+peaks <- read.table(peakFile, sep = '\t')
+```
+
+Peaks ovelapping with regulatory regions of a `r feature` but not its promoters are considered as the putative enhancer of the `r feature`. There are a total of `r printNum(nrow(peaks))` peaks found in the given peak file. The distribution of the size of the peaks were shown in the plot below (*peak-hist-1.pdf*). 
+
+```{r peak-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+pkHistUpBnd <- 15000
+df <- data.frame(size = peaks$V3 - peaks$V2)
+df$size[df$size > pkHistUpBnd] <- pkHistUpBnd
+ggplot(df, aes(x = size)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = 'Size', y = 'Frequency')
+```
+
+Note to see more details in the range where the majority of the peaks fall into, the size showing is capped at `r printNum(pkHistUpBnd)`. All peaks with a size above `r printNum(pkHistUpBnd)` was counted in the last bin. 
+
+```{r ovl-peak, results='hide', message=FALSE}
+# identify putative enhancers
+# sort the peaks according to coordinates and chromosome, the algorithm below 
+# relies on sorted peaks
+names(peaks) <- c('chr', 'start', 'end')
+peaks <- peaks[order(peaks$start), ]
+peaks <- peaks[order(peaks$chr), ]
+# create a peak ID
+peaks <- cbind(id = paste(peaks$chr, peaks$start, peaks$end, sep = ':'), peaks)
+
+# identify RR overlapping peaks for each gene
+distPeaks <- list() # putative enhancer
+proxPeaks <- list() # peaks overlapping with promoter
+actChr <- ''
+for (iRR in 1:nrow(rr)) {
+  if (iRR > 1 && iRR %% 1000 == 1) {
+    put(sprintf('%d regulatory regions have been processed.', iRR - 1))
+  }
+  
+  curRR <- rr[iRR, ]
+  if (curRR$chr != actChr) {
+    actChr <- curRR$chr
+    peaksInChr <- peaks[peaks$chr == actChr, ]
+  }
+  if (nrow(peaksInChr) == 0) next
+  
+  ovlPeaks <- peaksInChr[peaksInChr$end > curRR$start & peaksInChr$start < curRR$end, ]
+  if (nrow(ovlPeaks) == 0) next
+  # overlapping peaks found
+  # identify proximal peaks
+  pp <- NULL
+  for (tssPos in tss$pos[tss$gene == curRR$gene & tss$chr == curRR$chr]) {
+    pp <- c(pp, ovlPeaks$id[ovlPeaks$end > max(0, tssPos - promLeftExt) & ovlPeaks$start < tssPos + promRightExt])
+  }
+  pp <- unique(pp)
+  if (length(pp) > 0) {
+    if (curRR$gene %in% names(proxPeaks)) {
+      proxPeaks[[curRR$gene]] <- c(proxPeaks[[curRR$gene]], pp)
+    } else {
+      proxPeaks[[curRR$gene]] <- pp
+    }
+  }
+  
+  # identify distal peaks
+  dp <- ovlPeaks$id
+  if (length(pp) > 0) {
+    dp <- dp[!(dp %in% pp)]
+  }
+  if (length(dp) > 0) {
+    if (curRR$gene %in% names(distPeaks)) {
+      distPeaks[[curRR$gene]] <- c(distPeaks[[curRR$gene]], dp)
+    } else {
+      distPeaks[[curRR$gene]] <- dp
+    }
+  }
+}
+
+# count the number of overlapping distal peaks (putative enhancers) and proximal peaks for each gene
+ppStr <- rep('', nrow(expCntFull))
+names(ppStr) <- expCntFull[, expIdCol]
+dpStr <- ppStr
+nPPs <- rep(0, nrow(expCntFull))
+names(nPPs) <- expCntFull[, expIdCol]
+nDPs <- nPPs
+for (gene in names(nPPs)) {
+  if (gene %in% names(proxPeaks)) {
+    ppStr[gene] <- paste(proxPeaks[[gene]], collapse = '|')
+    nPPs[gene] <- length(proxPeaks[[gene]])
+  }
+  if (gene %in% names(distPeaks)) {
+    dpStr[gene] <- paste(distPeaks[[gene]], collapse = '|')
+    nDPs[gene] <- length(distPeaks[[gene]])
+  }
+}
+ovlPkDf <- cbind(expCntFull[, c(expIdCol, expAnnCols)], proxPeak = ppStr, distPeak = dpStr, 
+                 nProxPeak = nPPs, nDistPeak = nDPs)
+write.csv(ovlPkDf, paste0(outDataDir, '/ovl-peaks.csv'), 
+          row.names = FALSE, quote = FALSE)
+```
+
+There are `r printNum(sum(nPPs))` and `r printNum(sum(nDPs))` peaks identified as proximal regulatory elements and putative enhancers of genes, respectively. Note that the total may not add up to the total number of peaks. Because a peak can be neither a proximal regulatory element nor a putative enhancer of any gene, or can be proximal regulatory element of one gene and putative enhancer of another gene, or putative enhancers of multiple genes. The obtained proximal regulatory elements and putative enhancers of `r feature`s were saved to *ovl-peaks.csv*. The distribution of the number of overlapping distal peaks (i.e., putative enhancers) per each gene is shown in below histogram (*nOvl-peaks-1.pdf*).
+
+```{r nOvl-peaks, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+df <- data.frame(num = nDPs)
+ggplot(df, aes(x = num)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of distal peaks', y = 'Frequency')
+```
+
+### Filter based on correlation between accessibility and gene expression
+
+The variation in the accessibility of true enhancers of a gene are expected to correlate with the variation in the expression level of the gene. So, in the following, the putative enhancers of a gene with a high correlation (i.e., $\ge$ `r minAEC`) are recognized as the enhancers of the gene. 
+
+```{r data-for-aec, message=FALSE, results='hide'}
+# load accessibility quantification
+peakAcc <- read.csv(peakAccFile)
+# align accessibility and expression data 
+comSamps <- intersect(names(peakAcc)[2:ncol(peakAcc)], names(expCntFull)[expDataSCol:ncol(expCntFull)])
+accAln <- as.matrix(peakAcc[, comSamps])
+rownames(accAln) <- peakAcc$X
+# find peaks with accessibility of 0 and exclude
+peakToRm <- rownames(accAln)[apply(accAln, 1, function(x) return(length(which(x == 0)) == length(x)))]
+if (length(peakToRm) > 0) {
+  accAln <- accAln[!(rownames(accAln) %in% peakToRm), ]
+  write.csv(peakToRm, paste0(outDataDir, '/peak-no-aec.csv'), row.names = FALSE, quote = FALSE)
+}
+# expression data
+expAln <- as.matrix(expCntFull[, comSamps])
+rownames(expAln) <- expCntFull[, expIdCol]
+# find genes with expression of 0 and remove
+geneToRm <- rownames(expAln)[apply(expAln, 1, function(x) return(length(which(x == 0)) == length(x)))]
+if (length(geneToRm) > 0) {
+  expAln <- expAln[!(rownames(expAln) %in% geneToRm), ]
+  write.csv(expCntFull[expCntFull[, expIdCol] %in% geneToRm, ], 
+            paste0(outDataDir, '/gene-no-aec.csv'), row.names = FALSE, quote = FALSE)
+}
+```
+
+For a total of `r length(comSamps)` samples, there is availability of both accessibility and expression data. Only these samples will be used in the subsequent correlation calculation. Peaks and `r feature`s with quantification all 0's on all used samples will be excluded from the correlation calculation. There are `r length(peakToRm)` such peaks and `r length(geneToRm)` such genes, which (if any) have been saved to *peak-no-aec.csv* and *gene-no-aec.csv*, respectively. 
+
+```{r calc-aec, message=FALSE, results='hide'}
+distPeaks <- distPeaks[names(distPeaks) %in% rownames(expAln)] # retain only genes for which there are valid expression data
+
+geneToRm <- rep(FALSE, length(distPeaks)) # for flagging genes to remove due to no valid overlapping peaks
+names(geneToRm) <- names(distPeaks)
+aec <- list()
+aecToSave <- NULL
+for (gene in names(distPeaks)) {
+  if (length(peakToRm) > 0) {
+    # exclude peaks with no valid data
+    distPeaks[[gene]] <- distPeaks[[gene]][!(distPeaks[[gene]] %in% peakToRm)]
+    if (length(distPeaks[[gene]]) == 0) {
+      # no overlapping peaks left for the gene, mark it to remove
+      geneToRm[gene] <- TRUE
+      next
+    }
+  }
+  # now calculate the pearson correlation
+  aec[[gene]] <- cor(expAln[gene, ], t(accAln[distPeaks[[gene]], , drop = FALSE]))
+  ats <- data.frame(gene = rep(gene, length(aec[[gene]])), peak = distPeaks[[gene]], cor = t(aec[[gene]]))
+  if (is.null(aecToSave)) {
+    aecToSave <- ats
+  }
+  aecToSave <- rbind(aecToSave, ats)
+}
+if (length(which(geneToRm)) > 0) {
+  distPeaks <- distPeaks[!geneToRm]
+}
+write.csv(aecToSave, paste0(outDataDir, '/acc-exp-cor.csv'), row.names = FALSE, quote = FALSE)
+```
+
+Pearson correlation was computed for each pair of peak and gene, and saved to *acc-exp-cor.csv*. The following is a histogram (*ace-hist-1.pdf*) to show the distribution of obtained correlations. 
+
+```{r ace-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+df <- data.frame(cor = unlist(aec))
+ggplot(df, aes(x = cor)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = 'Correlation', y = 'Frequency')
+```
+
+```{r pred-enh, message=FALSE, results='hide'}
+# make prediction for enhancers based on correlation
+enh <- list()
+enhStr <- rep('', length(aec))
+names(enhStr) <- names(aec)
+nEnh <- rep(0, length(aec))
+names(nEnh) <- names(aec)
+for (gene in names(aec)) {
+  meetCond <- aec[[gene]] >= minAEC
+  if (length(which(meetCond)) > 0) {
+    enh[[gene]]  <- colnames(aec[[gene]])[meetCond]
+    enhStr[gene] <- paste(enh[[gene]], collapse = '|')
+    nEnh[gene] <- length(enh[[gene]])
+  }
+}
+enhToSave <- data.frame(expCntFull[match(names(nEnh), expCntFull[, expIdCol]), c(expIdCol, expAnnCols)], 
+                        enhancers = enhStr, nEnhancers = nEnh)
+write.csv(enhToSave, paste0(outDataDir, '/pred-enh.csv'), row.names = FALSE, quote = FALSE)
+```
+
+Distal peaks with a correlation (with their mapped `r feature`s) above `r minAEC` were predicted as the enhancers of corresponding `r feature`s. The predicted enhancers for each `r feature` were saved to *pred-enh.csv*. The distribution of the number of enhancers among `r feature`s is shown the below histogram (*nEnh-hist-1.pdf*).
+
+```{r nEnh-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+df <- data.frame(num = nEnh)
+ggplot(df, aes(x = num)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of predicted enhancers per gene', y = 'Frequency')
+```
+
+## Combine distal and proximal peaks
+
+```{r reg-ele, message=FALSE, results='hide'}
+regEle <- list()
+reStr <- rep('', nrow(expCntFull))
+names(reStr) <- expCntFull[, expIdCol]
+nRE <- rep(0, nrow(expCntFull))
+names(nRE) <- expCntFull[, expIdCol]
+
+for (gene in expCntFull[, expIdCol]) {
+  if (length(enh[[gene]]) > 0 || length(proxPeaks[[gene]]) > 0) {
+    if (length(enh[[gene]]) > 0 && length(proxPeaks[[gene]]) > 0) {
+      regEle[[gene]] <- c(enh[[gene]], proxPeaks[[gene]])
+    } else if (length(enh[[gene]]) > 0) {
+      regEle[[gene]] <- enh[[gene]]
+    } else {
+      regEle[[gene]] <- proxPeaks[[gene]]
+    }
+    reStr[gene] <- paste(regEle[[gene]], collapse = '|')
+    nRE[gene] <- length(regEle[[gene]])
+  }
+}
+
+reToSave <- data.frame(expCntFull[, c(expIdCol, expAnnCols)], regEle = reStr, nRegEle = nRE)
+write.csv(reToSave, paste0(outDataDir, '/reg-ele.csv'), row.names = FALSE, quote = FALSE)
+```
+
+Regulatory elements of each `r feature` is defined as the combination of proximal peaks (i.e., overlapping with promoter region) and predicted enhancers. The obtained regulatory elements for each `r feature` was saved to *reg-ele.csv*. The following plot (*nRE-hist-1.pdf*) shows the distribution of the number of regulatory elements per `r feature`.
+
+```{r nRE-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+df <- data.frame(num = nRE)
+ggplot(df, aes(x = num)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of regulatory elements per gene', y = 'Frequency')
+```
+
+## TF binding at peaks
+
+```{r tf-tobias, child=if (inputParams$tfTool == 'tobias') paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/grn/tf-tobias.Rmd')}
+```
+
+```{r tf-homer, child=if (inputParams$tfTool == 'homer') paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/grn/tf-homer.Rmd')}
+```
+
+## TF binding at regulatory elements of `r feature`s
+
+```{r tf-at-re, message=FALSE, results='hide'}
+featTfFull <- matrix(rep(0, length(regEle) * ncol(tfOcc)), nrow = length(regEle))
+rownames(featTfFull) <- names(regEle)
+colnames(featTfFull) <- colnames(tfOcc)
+for (iFeat in 1:length(regEle)) {
+  featTfFull[names(regEle)[iFeat], ]  <- apply(tfOcc[regEle[[iFeat]], , drop = F], 2, 
+                       function(x) if (sum(x)) return(1) else return(0)) 
+}
+
+# save to file
+featTfDf <- cbind(featId = rownames(featTfFull), 
+                  expCntFull[match(rownames(featTfFull), expCntFull[, expIdCol]), expAnnCols],
+                  featTfFull)
+names(featTfDf)[1] <- names(expCntFull)[expIdCol]
+write.csv(featTfDf, paste0(outDataDir, '/tf-at-re.csv'), row.names = FALSE, quote = FALSE)
+```
+
+For each `r feature`, the TFs with predicted binding at its regulatory elements were identified. The results can be found in *tf-at-re.csv*, where rows represent `r feature`s, columns represent TFs,1 means binding, and 0 means no. The number of binding TFs was counted for each gene. The plot below (*nTF-at-re-hist-1.pdf*) shows its distribution among all genes.  
+
+```{r nTF-at-re-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nReTfPlotDf <- data.frame(nTf = apply(featTfFull, 1, function(x) return(sum(x))), 
+                          nEle = sapply(regEle, function(x) return(length(x))))
+write.csv(cbind(expCntFull[match(rownames(featTfFull), expCntFull[, expIdCol]), c(expIdCol, expAnnCols)], nReTfPlotDf),
+          paste0(outDataDir, '/gene-re-tf-stat.csv'), row.names = F, quote = F)
+
+ggplot(nReTfPlotDf, aes(x = nTf)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of binding TFs at regulatory elements of individual genes', y = 'Frequency of genes')
+```
+
+The following plot (*nTF-at-re-scat-1.pdf*) shows how the number of binding TFs varying along with the number of predicted regulatory elements of genes. In addition, the Pearson correlation between the two was computed and provided in the plot. The data used in this plot and the one above can be found in *gene-re-tf-stat.csv*
+
+```{r nTF-at-re-scat, warning=FALSE, message=FALSE, results='hide', fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+ggscatter(nReTfPlotDf, x = "nEle", y = "nTf",
+          add = "reg.line",                                 # Add regression line
+          conf.int = TRUE,                                  # Add confidence interval
+          add.params = list(color = "blue", fill = "lightgray")) +
+  stat_cor(method = "pearson", label.x.npc =  0.6, label.y.npc = 0.2) +  # Add correlation coefficient
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of regulatory elements', y = '# of binding TFs')
+```
+
+The number of potential target genes was counted for each TF. The following histogram (*nTrt-of-TF-hist-1.pdf*) shows its distribution among all TFs. The data used in the plot can be found in *tf-trts-stat.csv*.
+
+```{r nTrt-of-TF-hist, warning=FALSE, fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTrtPlotDf <- data.frame(nTrt = apply(featTfFull, 2, function(x) return(sum(x))))
+write.csv(cbind(expCntFull[match(colnames(featTfFull), expCntFull[, expIdCol]), c(expIdCol, expAnnCols)], nTrtPlotDf),
+          paste0(outDataDir, '/tf-trts-stat.csv'), row.names = F, quote = F)
+ggplot(nTrtPlotDf, aes(x = nTrt)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of targets', y = 'Frequency of TFs')
+```
+
+## GRN of all `r feature`s
+
+```{r all-gene-prep} 
+featTf <- featTfFull
+# include only genes with potential regulatory being identified
+expCnt <- expCntFull[expCntFull[, expIdCol] %in% rownames(featTf), ] 
+if (inputParams$coeMode == 'lfc' && !is.null(expLfc)) {
+  # use log fold change to compute co-expression correlation
+  # replace the expression data with lfc
+  expCnt <- cbind(expCnt[, 1:(expDataSCol - 1)], expLfc[expCnt[, expIdCol], ])
+  # calculate variance
+  lfcVar <- apply(expCnt[, expDataSCol:ncol(expCnt)], 1, function(x) return(var(x)))
+  if (length(which(lfcVar == 0)) > 0) {
+    write.csv(expCnt[lfcVar == 0, ], paste0(outDataDir, '/gene-no-lfc-var.csv'), row.names = F, quote = F)
+    # exclude these genes from both featTf and expCnt
+    featTf <- featTf[!(rownames(featTf) %in% expCnt[lfcVar == 0, expIdCol]), ]
+    expCnt <- expCnt[lfcVar > 0, ]
+    # keep only TF with expression data
+    featTf <- featTf[, colnames(featTf) %in% expCnt[, expIdCol]]
+  }
+}
+
+sumOfFltByLfc <- function() {
+  paste0('Genes (including TFs) that show no variation in fold change among all comparisons ',
+         'were excluded from subsequent analysis. ',
+         sprintf('There were %d such genes, which can be found in *gene-no-lfc-var.csv*.', length(which(lfcVar == 0))))
+}
+```
+
+`r if(inputParams$coeMode == 'lfc') print('Log of fold change from pairwise comparisons is specified to use for gene co-expression evaluation. ')` `r if(inputParams$coeMode == 'lfc' && length(which(lfcVar == 0)) > 0) sumOfFltByLfc()`
+
+
+```{r all-gene-grn}
+fSetName <- 'all'
+out <- knitr::knit_expand('grn.Rmd')
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+```{r, child=if (deGrn) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/grn/de-grn.Rmd')}
+```
+

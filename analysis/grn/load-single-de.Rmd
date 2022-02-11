@@ -1,0 +1,22 @@
+
+## GRN of DE `r feature`s
+
+```{r de-gene} 
+# use only DE feature
+# load DE feature
+deRes <- read.csv(inputParams$deRes)
+deRes <- deRes[sort(deRes[, 2], index.return = TRUE)$ix, ]
+deFeats <- deRes[1:nTopDe, 1]
+
+# check if all DE features are in read counts file
+if (length(which(!(deFeats %in% expCntFull[, expIdCol]))) > 0) {
+  warning(paste0('There is(are) %d DE %s(s) that do not have data in the expression read count ',
+                 'data file and will be excluded from analysis. They are: %s.\n'), 
+          length(which(!(deFeats %in% expCntFull$gene_id))), feature, printNames(deFeats[!(deFeats %in% expCntFull$gene_id)]))
+  deFeats <- deFeats[deFeats %in% expCntFull[, expIdCol]]
+}
+```
+
+The top `r nTopDe` most differentially expressed `r feature`s found in the given file that provides the results from differential tests were included in the subsequent analysis.
+
+

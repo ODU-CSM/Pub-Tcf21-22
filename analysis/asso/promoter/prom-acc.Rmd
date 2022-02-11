@@ -1,0 +1,152 @@
+
+# Promoter accessibility and `r feature` expression
+
+This section explores promoter accessibility of `r feature`s of interest and its relationship with `r feature` expression. The relationship between `r feature` expression and promoter CpG density is also explored. CpG density is defined as the average number of CpGs within 150 base pairs to a CpG from both sides in the given region. The CpG density of all promoters is plotted in below (*cpg-dens-all-1.pdf*).
+
+```{r cpg-dens-all, fig.width=6, fig.height=5, dev=c('png', 'pdf')}
+plotCpGDens(cpgDens)
+
+# identify genes with low, medium and high CpG density at the promoter.
+if (is.null(cpgDensT)) {
+  sortcd <- sort(cpgDens)
+  cpgDensT[1] <- sortcd[ceiling(0.33 * length(cpgDens))]
+  cpgDensT[2] <- sortcd[floor(0.67 * length(cpgDens))]
+}
+
+promByCpGDens <- list()
+promByCpGDens$low <- names(cpgDens)[cpgDens < cpgDensT[1]]
+promByCpGDens$medium <- names(cpgDens)[cpgDens >= cpgDensT[1] & cpgDens <= cpgDensT[2]]
+promByCpGDens$high <- names(cpgDens)[cpgDens > cpgDensT[2]]
+```
+
+All the promoters were classified into three categories according to their CpG density: low (< `r cpgDens[1]`), medium ($\ge$ `r cpgDens[1]` and $\le$ `r cpgDens[2]`) and high (> `r cpgDens[2]`). The distribution of the promoters across the three categories is as follows: 
+
+```{r cpg-dens-dist}
+knitr::kable(cbind(Density = c('Low', 'Medium', 'High'), 
+                     'Number of promoters' = c(length(promByCpGDens$low), length(promByCpGDens$medium), 
+                                         length(promByCpGDens$high))), 
+             row.names = FALSE,
+             align = 'lc',
+             caption = 'The distribution of promoters across the three CpG density categories')
+
+```
+
+## Correlation of expression and promoter accessility at individual `r feature`s
+
+```{r prom-acc, child='cor-by-feat.Rmd'}
+```
+
+## Correlation of expression and promoter accessibility over all `r feature`s within individual sample group
+
+Below is the scatter plot of all expressed `r feature`s according to their expression level (log2(TPM)) and promoter accessibility (log2(TPM)) (*ea-of-exped.pdf*) averaged over samples within each individual sample group. Besides subplots that plot all included promoters, subplots that plots promoters with low, medium and high CpG density separately are also provided. The Pearson correlation between expression level and promoter accessibility over `r feature`s included in a subplot was computed and provided on top of the corresponding subplot.  
+
+
+```{r ea-of-exped, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+p <- plotExpAndAcc(expUseCom, extractData(accUseCom, rownames(expUseCom)),
+              grpInCom, frac = minTpm / 10)
+grid.draw(p)
+```
+
+A similar plot as above that include all `r nrow(expFull)` `r feature`s are provided in below:
+
+```{r ea-of-all, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+p <- plotExpAndAcc(expFullCom, accFullCom,
+              grpInCom, frac = 1)
+grid.draw(p)
+```
+
+## Promoter accessiblilty of `r feature`s of interest
+
+This section explores promoter accessibility of `r feature`s of interest and its relationship with `r feature` expression. To classify the promoters, accessibility data of each sample were standardized to have mean 0 and standard deviation 1 across promoters of `r feature`s included. Promoters received a standardized value that is no more than 0 in any of the samples were deemed to have constantly low accessibility; those with values above 0 in all samples were deemed to have constantly high accessibility; and the rest were deemed to have dynamic accessibility. The distribution of promoters across these three categories is as follows:
+
+```{r acc-clus}
+# use mean on normalized data as threshold to call low (<=mean across all samples), 
+# high (>= mean across all samples), dynamic accessibility (varying)
+accCNorm <- scale(accUse)
+accLbl <- apply(accCNorm, 1, function(x) {
+  if (length(which(x <= 0)) == length(x)) return(-1)
+  else if (length(which(x >= 0)) == length(x)) return(1)
+  else return(0)
+})
+accClus <- list(low = names(accLbl)[accLbl == -1], 
+                high = names(accLbl)[accLbl == 1],
+                dynamic = names(accLbl)[accLbl == 0])
+
+knitr::kable(cbind(Accessibility = c('Low', 'High', 'Dynamic'), 
+                     'Number of promoters' = c(length(accClus$low), length(accClus$high), 
+                                         length(accClus$dynamic))), 
+             row.names = FALSE,
+             align = 'lc',
+             caption = 'The distribution of promoters across the three categories based on accessibility')
+
+```
+
+
+### Differentially expressed `r feature`
+
+This subsection studies the promoter accessibility of `r feature`s identified in differential analysis. 
+
+```{r acc-de}
+featSets <- readxl::read_xlsx(diffMetaFile, na = 'NA', sheet = 'DE')
+deOutDir <- paste0(output, '/diff-exp')
+if (!dir.exists(deOutDir)) dir.create(deOutDir)
+
+out <- NULL
+for (iDe in 1:nrow(featSets)) {
+  # cat(knitr::knit_child("asso-by-de.Rmd", quiet = TRUE, envir = environment()))
+  out <- c(out, knitr::knit_expand(file.path(knitr::opts_knit$get("output.dir"), "promoter", "asso-by-de.Rmd")))
+  # out <- c(out, knitr::knit_expand("promoter/asso-by-de.Rmd"))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+```{r asso-by-emod, child=if (!is.null(cExpModFile)) 'asso-by-emod-main.Rmd'}
+### Co-expressed features
+```
+
+## Expression of `r feature`s of interest according to promoter accessibility
+
+This section explores expression of `r feature`s of interest and its relationship with promoter accessibility. 
+
+### Differentially accessible promoters
+
+This subsection studies the expression of `r feature`s whose promoters were identified differentially accessible in differential analysis. 
+
+```{r exp-da}
+featSets <- readxl::read_xlsx(diffMetaFile, na = 'NA', sheet = 'DA')
+daOutDir <- paste0(output, '/diff-acc')
+if (!dir.exists(daOutDir)) dir.create(daOutDir)
+
+out <- NULL
+for (iDa in 1:nrow(featSets)) {
+  out <- c(out, knitr::knit_expand(file = file.path(knitr::opts_knit$get("output.dir"), "promoter", "asso-by-da.Rmd")))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+```{r asso-by-amod, child=if (!is.null(cAccModFile)) 'asso-by-amod-main.Rmd'}
+### Co-accessible promoters
+```
+
+
+## Cross comparison between sets of differentially expressed `r feature`s and differentially accessible promoters
+
+```{r de-vs-da, results='asis'}
+featSets <- readxl::read_xlsx(diffMetaFile, na = 'NA', sheet = 'DE-VS-DA')
+deaOutDir <- paste0(output, '/de-vs-da')
+if (!dir.exists(deaOutDir)) dir.create(deaOutDir)
+
+out <- NULL
+for (iDea in 1:nrow(featSets)) {
+  out <- c(out, knitr::knit_expand(file = file.path(knitr::opts_knit$get("output.dir"), "promoter", "de-vs-da.Rmd")))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+```{r mod-comp-main, child=if (!is.null(cAccModFile) && !is.null(cExpModFile)) 'mod-comp.Rmd'}
+## Cross comparison between co-expressed feature modules and co-accessible promoter modules.
+```
+

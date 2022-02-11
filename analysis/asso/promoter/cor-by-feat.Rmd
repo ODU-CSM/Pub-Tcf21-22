@@ -1,0 +1,104 @@
+
+
+```{r calc-EA-cor, fig.width=6, fig.height=5, dev=c('png', 'pdf')}
+eaCorByFeat <- calcEACorByFeat(expNormCom, accNormCom, anno = anno,
+                   saveToFile = paste0(outDataDir, '/ea-cor-by-feat.csv'))
+```
+
+Pearson correlation between expression and promoter accessibility at all individual `r feature`s was computed (*data/ea-cor-by-feat.csv*). There are in total `r nrow(eaCorByFeat)` unique `r feature`s appears in the combination of the two types of data. Among them, there are `r length(which(eaCorByFeat$expressed & eaCorByFeat$accessible))` `r feature`s in common. More specifically, there is/are `r length(which(eaCorByFeat$expressed & !eaCorByFeat$accessible))` expressed `r feature`(s) whose promoter is not accessible in any sample; and there is/are `r length(which(eaCorByFeat$accessible & !eaCorByFeat$expressed))` `r feature`(s) whose promoter is accessible but are not expressed in any sample. Note that, genes are considered expressed needs a non-zero read count in at least one sample from the groups in common between the types of data. The correlations between expression and accessibility at these genes are 0 and not included in any of the histograms of the calculated correlations in the following panel (*ea-cor-by-feat-1.pdf*).  The top left figure (saved to *ea-cor-by-feat/all*) include all promoters that are accessible and the corresponding `r feature`s of which are expressed. These promoter were partitioned into subgroups according to their CpG density, i.e., low, medium and high. The rest of the figures in the panel below plot these three subgroups of promoters separately. The individual plot for each subgroup can be found under directory: *ea-cor-by-feat*.    
+
+```{r ea-cor-by-feat, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+figSubDir <- paste0(figDir, '/ea-cor-by-feat')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+# expressed and promoter accessible feature
+eaFeat <- rownames(eaCorByFeat)[eaCorByFeat$expressed & eaCorByFeat$accessible]
+corOfEAFeat<- eaCorByFeat[eaFeat, 'cor']
+names(corOfEAFeat) <- eaFeat
+plotCorrByCD(corOfEAFeat, promByCpGDens, saveToDir = figSubDir)
+```
+
+The following set of figures plots the promoter accessibility by expression (*acc-by-exp-1.pdf*). In the top row, the left (right) histogram includes all promoter accessibility quantification for `r feature`s that were (were not) expressed in any of the samples (*acc-by-exp/any-exp.pdf* and *acc-by-exp/all-unexp.pdf*). In the bottom row, the left (right) histogram includes average accessibility quantification in individual sample group for promoters whose corresponding `r feature`s were (were not) expressed in samples from the same group (*acc-by-exp/exp.pdf* and *acc-by-exp/unexp.pdf*). 
+
+```{r acc-by-exp, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+figSubDir <- paste0(figDir, '/acc-by-exp')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+grobs <- list()
+grobs[[1]] <- plotLogOfTpm(accFullCom[eaCorByFeat$expressed, ], 
+                           title = sprintf('Expressed %s', feature),
+                           saveToFile = paste0(figSubDir, '/any-exp'), 
+                           unit = 'FPM')
+grobs[[2]] <- plotLogOfTpm(accFullCom[!eaCorByFeat$expressed, ], 
+                           title = sprintf('Unexpressed %s', feature),
+                           saveToFile = paste0(figSubDir, '/all-unexp'), 
+                           unit = 'FPM') +
+   theme(axis.title.y = element_blank())
+grobs[[3]] <- plotLogOfTpm(accGrpAveCom[expGrpAveCom >= minTpm],
+                           saveToFile = paste0(figSubDir, '/exp'), 
+                           unit = 'FPM')
+grobs[[4]] <- plotLogOfTpm(accGrpAveCom[expGrpAveCom < minTpm],
+                           saveToFile = paste0(figSubDir, '/unexp'), 
+                           unit = 'FPM')  +
+   theme(axis.title.y = element_blank())
+grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+```
+
+The following is a similar set of figures as above, which plots expression quantification by promoter accessibility (*exp-by-acc-1.pdf*). The individual figures from left to right, top to bottom were saved to *exp-by-acc/any-acc.pdf*, *exp-by-acc/all-inacc.pdf*, *exp-by-acc/acc.pdf* and *exp-by-acc/inacc.pdf*.
+
+```{r exp-by-acc, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+figSubDir <- paste0(figDir, '/exp-by-acc')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+grobs <- list()
+grobs[[1]] <- plotLogOfTpm(expFullCom[eaCorByFeat$accessible, ], title = 'Promoter accessible',
+                           saveToFile = paste0(figSubDir, '/any-acc'))
+grobs[[2]] <- plotLogOfTpm(expFullCom[!eaCorByFeat$accessible, ], title = 'Promoter inaccessible',
+                           saveToFile = paste0(figSubDir, '/any-inacc')) +
+   theme(axis.title.y = element_blank())
+grobs[[3]] <- plotLogOfTpm(expGrpAveCom[accGrpAveCom >= minTpm],
+                           saveToFile = paste0(figSubDir, '/acc'))
+grobs[[4]] <- plotLogOfTpm(expGrpAveCom[accGrpAveCom < minTpm],
+                           saveToFile = paste0(figSubDir, '/inacc'))  +
+   theme(axis.title.y = element_blank())
+grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+```
+
+
+```{r cpg-dens-prep, }
+# high accessible but no expression
+accOfNoExp <- accFullCom[!eaCorByFeat$expressed, ]
+# use the average accessibility of genes that are expressed as a threshold
+# to determine whether a promoter is highly accessible
+accT <- mean(accFullCom[eaCorByFeat$expressed, ])  
+highAccAny <- accOfNoExp[rowMaxs(accOfNoExp) > accT, ]
+highAccAll <- accOfNoExp[rowMins(accOfNoExp) > accT, ]
+write.csv(cbind(id = rownames(accOfNoExp), 
+                anno[match(rownames(accOfNoExp), rownames(anno)), ],
+                anyHigh = rowMaxs(accOfNoExp) > accT,
+                allHigh = rowMins(accOfNoExp) > accT,
+                accOfNoExp), 
+          paste0(outDataDir, '/acc-of-noexp.csv'), row.names = FALSE,
+          quote = FALSE)
+```
+
+Figures in the panel below show the promoter CpG density of `r feature`s (*cpg-dens-by-ea-1.pdf*). `r str_to_sentence(feature)`s included in all figures had an accessible promoter. The set differs from each other in terms of `r feature` expression and the level of promoter accessibility. The top left figure (*cpg-dens/expressed.pdf*) includes all `r feature`s that were expressed. The top right ((*cpg-dens/unexpressed.pdf*)) includes `r feature`s that had no expression. The bottom left (*cpg-dens/any-high.pdf*) includes `r feature`s that had no expression and whose promoter is highly accessible in any of the samples but not all. A promoter is deemed as highly accessible when its corresponding TPM is above the average TPM of promoters of expressed genes (i.e., `r round(accT, 2)`). The bottom right ((*cpg-dens/all-high.pdf*)) includes `r feature`s that had no expression and whose promoter is highly accessible in all samples. 
+
+```{r cpg-dens-by-ea, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+figSubDir <- paste0(figDir, '/cpg-dens')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+grobs <- list()
+grobs[[1]] <- plotCpGDens(cpgDens[rownames(eaCorByFeat)[eaCorByFeat$expressed & eaCorByFeat$accessible]], 
+                          'Expressed', saveToFile = paste0(figSubDir, '/expressed'))
+grobs[[2]] <- plotCpGDens(cpgDens[rownames(accOfNoExp)], 'Unexpressed',
+                          saveToFile = paste0(figSubDir, '/unexpressed')) +
+   theme(axis.title.y = element_blank())
+grobs[[3]] <- plotCpGDens(cpgDens[rownames(highAccAny)[!(rownames(highAccAny) %in% rownames(highAccAll))]], 
+                          'Any high but not all', saveToFile = paste0(figSubDir, '/any-high'))
+grobs[[4]] <- plotCpGDens(cpgDens[rownames(highAccAll)], 'All high', 
+                          saveToFile = paste0(figSubDir, '/all-high'))  +
+   theme(axis.title.y = element_blank())
+grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+
+```

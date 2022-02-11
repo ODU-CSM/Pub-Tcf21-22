@@ -1,0 +1,271 @@
+---
+output: html_document
+---
+
+# Data Info
+
+```{r load-data}
+put(sprintf('Loading gene expression from %s ...', expCntFile))
+expInData <- read.csv(expCntFile) # load expression data
+
+put(sprintf('Loading promoter accessibility from %s ...', accCntFile))
+accInData <- read.csv(accCntFile) # load accessibility data
+
+put(sprintf('Loading peak accessibility from %s ...', peakTpmFile))
+peakTpm <- read.csv(peakTpmFile) # load accessibility peak TPM data
+# ignore the peak_id column and use seqid:start:end as the pick id
+peakTpmT <- as.matrix(peakTpm[, peakDataSCol:ncol(peakTpm)])
+rownames(peakTpmT) <- paste(peakTpm[, 2], peakTpm[, 3], peakTpm[, 4], sep = ':')
+peakTpm <- peakTpmT
+rm(peakTpmT)
+
+# Prepare annotation
+expAnno <- expInData[, c(expIdCol, expAnnCols)]
+accAnno <- accInData[, c(accIdCol, accAnnCols)]
+# below it is assumed the two annotations are exactly aligned.
+# TODO: put check to prevent user error
+names(accAnno) <- names(expAnno)
+anno <- rbind(expAnno, accAnno)
+# remove duplicated rows 
+anno <- anno[!duplicated(anno[, 1]), ]
+rownames(anno) <- anno[, 1]
+anno <- anno[, 2:ncol(anno)] # drop the id column
+
+# load promoter CpG density
+put(sprintf('Loading promoter CpG density from %s ...', cpgDensFile))
+cpgDens <- read.csv(cpgDensFile) 
+if (feature == 'gene') {
+  # compute the average CpG density at each promoter, averaging over all transcript promoters of the gene
+  tmp <- aggregate.data.frame(cpgDens[, 'density'], list(cpgDens$gene), mean)
+  cpgDens <- tmp[, 2]
+  names(cpgDens) <- tmp[, 1]
+  rm(tmp)
+} else {
+  tmp <- cpgDens$density
+  names(tmp) <- cpgDens$transcript
+  cpgDens <- tmp
+  rm(tmp)
+} 
+
+# load peak CpG density
+put(sprintf('Loading peak CpG density from %s ...', peakCpgDensFile))
+peakCpgDens <- read.csv(peakCpgDensFile)
+tmp <- peakCpgDens$density
+names(tmp) <- paste(peakCpgDens[, 1], peakCpgDens[, 2], peakCpgDens[, 3], sep = ':')
+peakCpgDens <- tmp
+rm(tmp)
+
+# process sample grouping
+# sample in expression data
+put(sprintf('Loading sample grouping in expression data from %s ...', expSampGrpSFile))
+expSGrpSpec <- read.csv(expSampGrpSFile, header = TRUE, stringsAsFactors = FALSE)
+expSGrpCol <- 3
+expSGrps <- unique(expSGrpSpec[, expSGrpCol])
+expSOfGrp <- list()
+expSUse <- NULL # only use samples in the sample group specification file
+for (i in 1:length(expSGrps)) {
+  expSOfGrp[[i]] <- expSGrpSpec[expSGrpSpec[, expSGrpCol] == expSGrps[i], 1]
+  if (length(which(!(expSOfGrp[[i]] %in% names(expInData)))) > 0) {
+    stop(sprintf('Sample(s): %s in expSampGrpSFile cannot be found in expCntFile', 
+       paste0(expSOfGrp[[i]][which(!(expSOfGrp[[i]] %in% names(expInData)[expDataSCol:ncol(expInData)]))], 
+            collapse = ';')))
+  }
+  expSUse <- c(expSUse, expSOfGrp[[i]])
+}
+names(expSOfGrp) <- expSGrps
+
+# sample in accessibility data
+cat(sprintf('Loading sample grouping in accessibility data from %s ...', accSampGrpSFile))
+accSGrpSpec <- read.csv(accSampGrpSFile, header = TRUE, stringsAsFactors = FALSE)
+accSGrpCol <- 3
+accSGrps <- unique(accSGrpSpec[, accSGrpCol])
+accSOfGrp <- list()
+accSUse <- NULL # only use samples in the sample group specification file
+for (i in 1:length(accSGrps)) {
+  accSOfGrp[[i]] <- accSGrpSpec[accSGrpSpec[, accSGrpCol] == accSGrps[i], 1]
+  if (length(which(!(accSOfGrp[[i]] %in% names(accInData)))) > 0) {
+    stop(sprintf('Sample(s): %s in accSampGrpSFile cannot be found in accCntFile', 
+       paste0(accSOfGrp[[i]][which(!(accSOfGrp[[i]] %in% names(accInData)[accDataSCol:ncol(accInData)]))], 
+            collapse = ';')))
+  }
+  accSUse <- c(accSUse, accSOfGrp[[i]])
+}
+names(accSOfGrp) <- accSGrps
+
+# if (!all(expSGrps %in% accSGrps)) stop('Not all sample groups in expression data appears in accessibility data')
+# if (!all(accSGrps %in% expSGrps)) stop('Not all sample groups in accessibility data appears in expression data')
+
+# load comparisons
+expComps <- read.csv(deCompFile)
+accComps <- read.csv(daCompFile)
+```
+
+```{r data-info}
+printSampGrpDetail <- function(sog) {
+  nSampMax <- 5 # maximum number of samples in a group to print out the name of samples 
+  
+  sizeMax <- length(sog[[1]])
+  if (length(sog) > 1) {
+    for (i in 2:length(sog)) {
+      if (sizeMax < length(sog[[i]])) {
+        sizeMax <- length(sog[[i]])
+      }
+    }
+  }
+ 
+  grp <- names(sog)[1]
+  if (sizeMax > 5) {
+    str <- sprintf('%s(N = %d),', grp, length(sog[[grp]]))
+  } else {
+    str <- sprintf('%s(%s),', grp, printNames(sog[[grp]]))
+  }
+  
+  if (length(sog) > 2) {
+    for (grp in names(sog)[2:(length(sog) - 1)]) {
+      if (sizeMax > 5) {
+        str <- sprintf('%s %s(N = %d),', str, grp, length(sog[[grp]]))
+      } else {
+        str <- sprintf('%s %s(%s),', str, grp, printNames(sog[[grp]]))
+      }
+    }
+  }
+  
+  grp <- names(sog)[length(sog)]
+  if (sizeMax > 5) {
+    str <- sprintf('%s and %s(N = %d)', str, grp, length(sog[[grp]]))
+  } else {
+    str <- sprintf('%s and %s(%s)', str, grp, printNames(sog[[grp]]))
+  }
+  
+  return(str)
+}
+```
+
+## Expression data
+
+There are expression data of total `r sprintf('%s %s', printNum(nrow(expInData)), feature)`s for `r printNum(ncol(expInData) - expDataSCol + 1)` samples in the input data file (i.e., "*expCntFile*"). The samples are: `r printNames(names(expInData)[expDataSCol:ncol(expInData)])`. There are `r printNum(length(expSUse))` samples found in the given "*expSampGrpSFile*". These samples are grouped into `r printNum(length(expSOfGrp))` groups, which are: `r printNames(names(expSOfGrp))`. Only these samples (, which may be a subset of those in the expression data file) will be included in the subsequent analysis and are: `r printSampGrpDetail(expSOfGrp)`.
+
+```{r exp-data-prep, results='asis'}
+# prepare expression data for analysis
+if (is.null(expTpmFile)) {
+  # load count data and later calculate the TPM
+  # retain only samples included in the sample grouping file for analysis
+  expUse <- as.matrix(expInData[, expSUse] )
+  rownames(expUse) <- expInData[, expIdCol]
+  
+  # compute TPM
+  event <- 'expression'
+  cat(knitr::knit_child("calc-tpm.Rmd", quiet=TRUE, envir=environment()))
+  rm(event)
+} else {
+  # directly load TPM data
+  expUse <- read.csv(expTpmFile)
+  rownames(expUse) <- expUse[, expIdCol]
+  # retain only samples included in the sample grouping file for analysis
+  expUse <- as.matrix(expUse[, expSUse])
+  expUse <- expUse[expInData[, expIdCol], ]
+}
+```
+
+## Promoter accessibility data
+
+There are accessibility data of total `r sprintf('%s %s', printNum(nrow(accInData)), feature)` promoters for `r printNum(ncol(accInData) - accDataSCol + 1)` samples in the input data file (i.e., "*accCntFile*"). The samples are: `r printNames(names(accInData)[accDataSCol:ncol(accInData)])`. There are `r printNum(length(accSUse))` samples found in the given "*accSampGrpSFile*". These samples are grouped into `r printNum(length(accSOfGrp))` groups, which are: `r printNames(names(accSOfGrp))`. Only these samples (, which may be a subset of those in the accessibility data file) will be included in the following analysis and are: `r printSampGrpDetail(accSOfGrp)`.
+
+```{r acc-data-prep, results='asis'}
+# prepare promoter accessibility data for analysis
+if (is.null(accTpmFile)) {
+  # load count data and later calculate the TPM
+  # retain only samples included in the sample grouping file for analysis
+  accUse <- as.matrix(accInData[, accSUse])
+  rownames(accUse) <- accInData[, accIdCol]
+  
+  # calculate TPM
+  event <- 'accessibility'
+  cat(knitr::knit_child("calc-tpm.Rmd", quiet=TRUE, envir=environment()))
+  rm(event)
+} else {
+  # directly load TPM data
+  accUse <- read.csv(accTpmFile)
+  rownames(accUse) <- accUse[, accIdCol] 
+  # retain only samples included in the sample grouping file for analysis
+  accUse <- as.matrix(accUse[, accSUse])
+  accUse <- accUse[accInData[, accIdCol], ]
+}
+```
+
+```{r more-data-prep}
+grpInCom <- intersect(accSGrps, expSGrps) # Sample groups appear in both datasets
+if (length(grpInCom) < 2) {
+  stop(sprintf(paste0('Minimum 2 in common sample groups between expression and accessibility data. However, ',
+                      'only %d are found.'), length(grpInCom)))
+}
+
+# compose the full data of feature expression and promoter accessibility
+allFeats <- unique(c(rownames(expUse), rownames(accUse)))
+accFull <- extractData(accUse, allFeats)
+expFull <- extractData(expUse, allFeats)
+
+# calculate group average
+accGrpAve <- calcGrpAve(accFull, accSGrps, accSOfGrp)
+expGrpAve <- calcGrpAve(expFull, expSGrps, expSOfGrp)
+
+# normalize each row in the data to have mean 0 and std 1
+expNorm <- zscore(expUse)
+accNorm <- zscore(accUse)
+peakNorm <- zscore(peakTpm)
+
+# set up variables that hold aligned data to facilitate subsequent analysis
+dataNeedAln <- length(grpInCom) < length(expSGrps) || length(grpInCom) < length(accSGrps)
+if (!dataNeedAln) {
+  expUseCom <- expUse
+  accUseCom <- accUse
+  peakTpmCom <- peakTpm
+  
+  allFeatsCom <- allFeats
+  accFullCom <- accFull
+  expFullCom <- expFull
+  
+  accGrpAveCom <- accGrpAve
+  expGrpAveCom <- expGrpAve
+  
+  expNormCom <- expNorm
+  accNormCom <- accNorm
+  peakNormCom <- peakNorm
+}
+```
+
+
+```{r aln-data-hld, child=if (dataNeedAln) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/omics-asso/data/aln-data.Rmd')}
+### align the two types of data
+```
+
+## Classfication of `r feature`s according to expresssion
+
+To classify `r feature`s (appearing in both "*expCntFile*" and "*accCntFile*") according to their expression level, the expression data of each sample were standardized to have mean 0 and standard deviation 1 across all `r feature`s. `r str_to_sentence(feature)` received a standardized value that is no more than 0 in any of the samples were deemed to have constantly low expression; those with values above 0 in all samples were deemed to have constantly high expression; and the rest were deemed to have dynamic expression. The distribution of `r feature`s across these three categories is as follows:
+
+```{r exp-clus}
+# use mean on normalized data as threshold to call low (<=mean across all samples), 
+# high (>= mean across all samples), dynamic accessibility (varying)
+expCNorm <- scale(expFull)
+expLbl <- apply(expCNorm, 1, function(x) {
+  if (length(which(x <= 0)) == length(x)) return(-1)
+  else if (length(which(x >= 0)) == length(x)) return(1)
+  else return(0)
+})
+expClus <- list(low = names(expLbl)[expLbl == -1], 
+                high = names(expLbl)[expLbl == 1],
+                dynamic = names(expLbl)[expLbl == 0])
+
+expClusDist <- cbind(Expression = c('Low', 'High', 'Dynamic'), 
+                     'Number' = c(length(expClus$low), length(expClus$high), 
+                                         length(expClus$dynamic)))
+colnames(expClusDist) <- c('Expression', sprintf('Number of %ss', feature))
+knitr::kable(expClusDist, row.names = FALSE, align = 'lc',
+             caption = sprintf('The distribution of %ss across the three categories based on expression',
+                               feature))
+
+```
+
+Note, such `r feature` characterization will be used in subsequent association analysis. 
+
+

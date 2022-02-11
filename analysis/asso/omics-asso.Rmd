@@ -1,0 +1,292 @@
+---
+title: "`r params$title`"
+author: "`r params$author`"
+date: "`r params$date`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 4
+    df_print: paged
+    toc_float: true
+    number_sections: true
+bibliography: ../literature.bib
+params:
+  title: Association anlaysis of multi-omics data
+  author: Javon
+  date: January 14, 2021
+  feature: gene
+  expCntFile: NULL
+  expTpmFile: NULL
+  expIdCol: 1
+  expAnnCols: 2;3;4;5 
+  expDataSCol: 6
+  expSCoorCol: 3
+  expECoorCol: 4
+  expSampGrpSFile: NULL
+  accCntFile: NULL
+  accTpmFile: NULL
+  accIdCol: 1
+  accAnnCols: 2;3;4;5
+  accDataSCol: 7
+  accSCoorCol: 3
+  accECoorCol: 4
+  accSampGrpSFile: NULL
+  cpgDensFile: NULL
+  deCompFile: NULL
+  deResDir: NULL
+  cExpModFile: NULL
+  daCompFile: NULL
+  daResDir: NULL
+  cAccModFile: NULL
+  diffMetaFile: NULL
+  peakTpmFile: NULL
+  peakDataSCol: 5
+  daPeakDir: NULL
+  distalPeakFile: NULL
+  peakCpgDensFile: NULL
+  promBedFile: NULL
+  motGeneMap: NULL
+  dstlPkMotDir: NULL
+  minEModCor: 0.5
+  minAModCor: 0.5
+  minTpm: 0.1
+  cpgDensT: 25;75
+  minPeakCorT: 0.5
+  output: NULL
+  logFile: NULL
+  note: Promoters are defined as $\pm 500$bp centred at the annotated TSS of each
+    Gene
+---
+
+
+<!-- 
+Input parameters:
+
+--> 
+
+```{r set-up, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+inputParams <- params
+# set up for testing
+test = FALSE
+if (test) {
+  inputRootDir <- '/scratch-lustre/ml-csm/projects/tissue-regen/analysis/fat-mm/ana-101721/wt'
+  outputRootDir <- '/scratch-lustre/ml-csm/projects/tissue-regen/analysis/fat-mm/ana-101721/wt/asso/report'
+  refGenome <- '/scratch-lustre/ml-csm/datasets/genomics/ref-genome/mouse/GRCm38/ensembl'
+  
+  # expression quantification
+  inputParams$expCntFile <- paste0(inputRootDir, '/rna/validation/results/gene/data/data-used.csv')
+  inputParams$expTpmFile <- paste0(inputRootDir, '/rna/validation/results/gene/data/tpm.csv')
+  inputParams$expSampGrpSFile <- paste0(inputRootDir, '/rna/data/samp-grp.csv')
+  
+  # chromatin accessibility 
+  inputParams$accCntFile <- paste0(inputRootDir, '/atac/validation/results/gprom/data/data-used.csv')
+  inputParams$accTpmFile <- paste0(inputRootDir, '/atac/validation/results/gprom/data/tpm.csv')
+  inputParams$accSampGrpSFile <- paste0(inputRootDir, '/atac/data/samp-grp.csv')
+  
+  inputParams$cpgDensFile <- paste0(refGenome, '/annotations/prom-cpg-density.csv')
+  inputParams$promBedFile <- paste0(refGenome, '/annotations/prom.bed')
+  inputParams$motGeneMap <- paste0(refGenome, '/../../homer/motif-gene-match.txt')
+  
+  # differential expression
+  inputParams$deCompFile <- paste0(inputRootDir, '/rna/de/comparisons.csv')
+  inputParams$deResDir <- paste0(inputRootDir, '/rna/de/results/gene/de-tests')
+  # co-expression module
+  # inputParams$cExpModFile <- paste0(inputRootDir, '/rna/module/results/gene/data/module.RData')
+  
+  # differential accessibility
+  inputParams$daCompFile <- paste0(inputRootDir, '/atac/da/comparisons.csv')
+  inputParams$daResDir <- paste0(inputRootDir, '/atac/da/results/gprom/de-tests')
+  # co-accessibility
+  # inputParams$cAccModFile <- paste0(inputRootDir, '/atac/module/results/gprom/data/module.RData')
+  
+  inputParams$diffMetaFile <- paste0(inputRootDir, '/asso/report/diff-meta.xlsx')
+  
+  # ATAC-peak
+  inputParams$peakTpmFile <- paste0(inputRootDir, '/atac/validation/results/peak/data/tpm.csv')
+  inputParams$daPeakDir <- paste0(inputRootDir, '/atac/da/results/peak/de-tests')
+  inputParams$distalPeakFile <- paste0(inputRootDir, '/atac/data/peakar/mrgd-peaks/ft-ovl/peaks/prom/data/all/all-novl.peaks')
+  inputParams$peakCpgDensFile <- paste0(inputRootDir, '/atac/data/peakar/mrgd-peaks/peaks/data/all/all-cpg-density.csv')
+  inputParams$dstlPkMotDir <- paste0(inputRootDir, '/atac/data/peakar/mrgd-peaks/motif/distal/pos-strd/data')
+  
+  inputParams$output <- paste0(outputRootDir, '/results/gene-1')
+  inputParams$logFile <- paste0(outputRootDir, '/run-log/asso-gene-1.log')
+  
+  inputParams$note <- 'Promoters are defined as $\\pm 500$bp centred at the annotated TSS of each Gene'
+}
+```
+
+```{r valid-input, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+if (is.null(inputParams$expCntFile)) stop('Parameter expCntFile is required')
+if (is.null(inputParams$accCntFile)) stop('Parameter accCntFile is required')
+if (is.null(inputParams$deCompFile)) stop('Parameter deCompFile is required')
+if (is.null(inputParams$daCompFile)) stop('Parameter daCompFile is required')
+if (is.null(inputParams$output)) stop('Parameter output is required')
+```
+
+***Note***
+
+Association analysis will be carried out for all `r params$feature`s included in the input files as appropriate, meaning no filtering will be done if not explicitly indicated otherwise. This script is expected to be run after the validation step, in which a read count dataset has been thoroughly inspected and unneeded `r params$feature`s have been filtered. All figures can be found in the *figures* folder under the given output directory. `r params$note`
+
+```{r init, include=FALSE}
+library(RColorBrewer)
+library(viridis)
+library(ggplot2)
+library(Rtsne)
+library(grid)
+library(ComplexHeatmap)
+suppressPackageStartupMessages(library(circlize))
+library(gridExtra)
+library(stringr)
+library(english)
+library(logr)
+library(gg.gap)
+library(matrixStats)
+library(WGCNA)
+library(latex2exp)
+
+options(stringsAsFactors = FALSE)
+
+feature <- inputParams$feature
+if (!(feature %in% c('gene', 'transcript'))) {
+  stop(sprintf('The input feature: %s is not currently supported', feature))
+}
+
+##### expression data file and its specification #####
+expCntFile <- inputParams$expCntFile
+expTpmFile <- inputParams$expTpmFile
+expIdCol <- inputParams$expIdCol
+
+# annotation columns, it is assumed gene_symbol is among the annotations, which is 
+# required for matching genes in motif enrichment analysis
+if (!is.null(inputParams$expAnnCols) && !is.integer(inputParams$expAnnCols)) {
+  expAnnCols <- as.integer(strsplit(inputParams$expAnnCols, ';')[[1]])
+}
+
+expDataSCol <- inputParams$expDataSCol
+expSCoorCol <- inputParams$expSCoorCol
+expECoorCol <- inputParams$expECoorCol
+expSampGrpSFile <- inputParams$expSampGrpSFile
+########################################################
+
+##### accessibility data file and its specification ####
+accCntFile <- inputParams$accCntFile
+accTpmFile <- inputParams$accTpmFile
+accIdCol <- inputParams$accIdCol
+
+if (!is.null(inputParams$accAnnCols) && !is.integer(inputParams$accAnnCols)) {
+  accAnnCols <- as.integer(strsplit(inputParams$accAnnCols, ';')[[1]])
+  if (length(expAnnCols) != length(accAnnCols)) {
+    stop('Annotation is inconsistent in expression and accessibility data.')
+  }
+}
+
+accDataSCol <- inputParams$accDataSCol
+accSCoorCol <- inputParams$accSCoorCol
+accECoorCol <- inputParams$accECoorCol
+accSampGrpSFile <- inputParams$accSampGrpSFile
+#########################################################
+
+####################### CpG #############################
+cpgDensFile <- inputParams$cpgDensFile  # CpG density
+#########################################################
+
+
+########### differential expression input ###############
+deCompFile <- inputParams$deCompFile
+deResDir <- inputParams$deResDir
+cExpModFile <- inputParams$cExpModFile
+########################################################
+
+########## differential accessibility input ############
+daCompFile <- inputParams$daCompFile
+daResDir <- inputParams$daResDir
+daPeakDir <- inputParams$daPeakDir
+cAccModFile <- inputParams$cAccModFile
+########################################################
+
+diffMetaFile <- inputParams$diffMetaFile
+
+################### Peaks ######################
+# it is assumed the first four columns in peakTpmFile are:
+# peak_id, seqid, start and end. The first column, i.e., peak_id
+# is not utilized in the analysis. The peaks are identified by
+# seqid:start:end instead. 
+peakDataSCol <- inputParams$peakDataSCol
+peakTpmFile <- inputParams$peakTpmFile
+distalPeakFile <- inputParams$distalPeakFile
+peakCpgDensFile <- inputParams$peakCpgDensFile
+dstlPkMotDir <- inputParams$dstlPkMotDir
+# promBedFile is used to obtain the TSS when identifying the closet feature
+# to distal peaks. The center of the promoter is considered as the TSS
+# Use the promoter bed file generated by the pipeline
+# TODO: directly input TSS annotation or extract from gtf file
+promBedFile <- inputParams$promBedFile
+# minimum correlation that a peak has with its paired gene to 
+# consider it as an expression highly correlated peak
+minPeakCorT <- inputParams$minPeakCorT
+# motif - gene mapping
+motGeneMapFile <- inputParams$motGeneMap
+#######################################################
+
+####### parameters for adjusting the analysis ##########
+# minimum correlation associated with a co-expression module (to a group specific pattern)
+# to have it included in the analysis
+minEModCor <- inputParams$minEModCor
+# minimum correlation associated with a co-accessibility module (to a group specific pattern)
+# to have it included in the analysis
+minAModCor <- inputParams$minAModCor
+# minimum TPM used to consider a gene/transcript expressed or a promoter accessible
+minTpm <- inputParams$minTpm
+# thresholds used to classifier promoter based on CpG density, low, medium and high
+# two numbers separately by ";", e.g., "25;75", below 25 - low, [25, 75] - medium, above 75 high
+if (!is.null(inputParams$cpgDensT)) {
+  cpgDensT <- as.numeric(strsplit(inputParams$cpgDensT, split = ';')[[1]])
+} else {
+  cpgDensT <- NULL
+}
+########################################################
+
+#################### output ############################
+output <- inputParams$output
+logFile <- inputParams$logFile
+########################################################
+
+# set up output folders
+outDataDir <- paste0(output, '/data')
+if (!dir.exists(outDataDir)) dir.create(outDataDir)
+figDir <- paste0(output, '/figures')
+if (!dir.exists(figDir)) dir.create(figDir)
+
+# set up log
+if (is.null(logFile)) {
+  logFile <- file.path(tempdir(), "asso.log")
+}
+logger <- log_open(logFile, logdir = FALSE)
+options("logr.notes" = FALSE)
+
+# log passed in running parameters
+put("Input parameters: ", console = FALSE)
+put(paste("expCntFile=", inputParams$expCntFile), console = FALSE)
+put(paste("output=", inputParams$output), console = FALSE)
+
+knitr::opts_chunk$set(echo = FALSE, results = 'hide', message = FALSE)
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'), fig.align='center')
+knitr::opts_chunk$set(dev.args = list(png = list(type = "cairo")))
+# knitr::opts_chunk$set(fig.pos = "!H", out.extra = "")
+
+# switches that are primarily to facilitate debugging
+analysis <- c(prom = TRUE, enhn = TRUE)
+```
+
+```{r utils, child='utils.Rmd'}
+```
+
+```{r data, child='data/data.Rmd'}
+```
+
+```{r prom-acc, child=if (analysis['prom']) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/omics-asso/promoter/prom-acc.Rmd')}
+```
+
+```{r enhn-acc, child=if (analysis['enhn']) paste0(Sys.getenv(c('GIT_LIB_J')), '/Dev-FGen-PAP/rmd/omics-asso/enhancer/enhn-acc.Rmd')}
+```
+

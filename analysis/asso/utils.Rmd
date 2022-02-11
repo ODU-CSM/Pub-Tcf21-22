@@ -1,0 +1,1089 @@
+```{r generic-utils}
+# letter - indicates whether to print numbers below zero as English letters
+printNum <- function(number, letter = TRUE) {
+  if (number < 10 && letter) {
+    return(english(number))
+  } else {
+    return(prettyNum(number, big.mark = ','))
+  }
+}
+
+printNames <- function(nms) {
+  if (length(nms) == 1) {
+    return(nms)
+  }
+  str <- paste(nms[1:(length(nms) - 1)], collapse = ', ')
+  str <- sprintf('%s and %s', str, nms[length(nms)])
+  return(str)
+}
+```
+
+```{r data-access-utils}
+getGrpOfSamp <- function(samps, data = 'exp') {
+  if (data == 'exp') {
+    return(expSGrpSpec[match(samps, expSGrpSpec$Sample), expSGrpCol])
+  } else if (data == 'acc') {
+    return(accSGrpSpec[match(samps, accSGrpSpec$Sample), accSGrpCol])
+  } else {
+    stop(sprintf('Unknown data type: %s', data))
+  }
+}
+
+getSampByGrp <- function(grp, data = 'exp') {
+  if (data == 'exp') {
+    return(expSOfGrp[[grp]])
+  } else if (data == 'acc') {
+    return(accSOfGrp[[grp]])
+  } else {
+    stop(sprintf('Unknown data type: %s', data))
+  }
+}
+
+# get the label (expected to be more readable) of a group
+getGrpLbl <- function(grp, data = 'exp') {
+  return(grp)
+}
+```
+
+```{r data-manip-utils}
+zscore <- function(matrix){
+  return( t(scale(t(matrix))))
+}
+
+# extract data for a given set of features.
+# For features that do not appear in the data, fill in with minimum value in input data
+extractData <- function(dataIn, feats, addNoise = FALSE) {
+  vals <- rep(min(dataIn), length(feats) * ncol(dataIn))
+  if (addNoise) {
+    vals <- vals + rnorm(length(vals), mean = 0, sd = abs(min(dataIn)) / 100)
+  }
+  dataOut <- matrix(vals, nrow = length(feats))
+  colnames(dataOut) <- colnames(dataIn)
+  rownames(dataOut) <- feats
+  iRowWithData <- rownames(dataOut) %in% rownames(dataIn)
+  dataOut[iRowWithData, ] <- dataIn[match(rownames(dataOut)[iRowWithData], rownames(dataIn)), ]
+  # commFeats <- feats[feats %in% rownames(dataIn)]
+  # dataOut[commFeats, ] <- dataIn[commFeats, ]
+  return(dataOut)
+}
+
+# compute group average for each gene in the input dataset
+calcGrpAve <- function(dataIn, sampGrps, sampByGrp) {
+  dataOut <- matrix(rep(NA, nrow(dataIn) * length(sampGrps)), nrow = nrow(dataIn))
+  rownames(dataOut) <- rownames(dataIn)
+  colnames(dataOut) <- sampGrps
+  
+  for (grp in sampGrps) {
+    if (length(sampByGrp[[grp]]) > 1) {
+      dataOut[, grp] <- rowMeans(dataIn[, sampByGrp[[grp]]])
+    } else {
+      dataOut[, grp] <- dataIn[, sampByGrp[[grp]]]
+    }
+  }
+  return(dataOut)
+}
+
+# calculate correlation between expression and accessibility by individual features
+calcEACorByFeat <- function(expData, accData, anno = NULL, saveToFile = NULL) {
+  # group average of expression data for each common feature
+  expGrpAve <- calcGrpAve(expData, grpInCom, expSOfGrp)
+  # group average of accessibility data
+  accGrpAve <- calcGrpAve(accData, grpInCom, accSOfGrp)
+  
+  # all distinct features included in the two datasets
+  allFeats <- unique(c(rownames(expData), rownames(accData)))
+  # obtain common features
+  commFeats <- intersect(rownames(expGrpAve), rownames(accGrpAve))
+  expGrpAve <- expGrpAve[commFeats, ]
+  accGrpAve <- accGrpAve[commFeats, ]
+  
+  # compute correlation
+  corrOfComm <- sapply(1:nrow(expGrpAve), function(x) {
+    return(cor(expGrpAve[x, ], accGrpAve[x, ], method = 'pearson'))
+  })
+  names(corrOfComm) <- commFeats
+  corrOfAll <- rep(0, length(allFeats))
+  names(corrOfAll) <- allFeats
+  corrOfAll[names(corrOfComm)] <- corrOfComm
+  
+  corr <- data.frame(cor = corrOfAll,  
+                     expressed = allFeats %in% rownames(expData),
+                     accessible = allFeats %in% rownames(accData))
+  rownames(corr) <- allFeats
+  
+  if (!is.null(saveToFile)) {
+    if (!is.null(anno)) {
+      corrOut <- cbind(id = rownames(corr), anno[rownames(corr), ], corr)
+    } else {
+      corrOut <- cbind(id = rownames(corr), corr)
+    }
+    write.csv(corrOut, saveToFile, row.names = FALSE, quote = FALSE)
+  }
+  return(corr)
+}
+
+# find closest feature (i.e., gene or transcript) to given genomic regions
+# Input:
+#   regions - a dataframe providing genomic regions with three columns: chr, start, end in sequence
+#   ann - a data frame providing feature annotations, with four columns: feat_id, chr, start and end in sequence
+#         if the mode is 'start', the end column is not needed
+#   mode - either 'body' or 'start' (by default), based on which the search is performed.
+#          body means the body of features, i.e., from start to end; start means using the 
+#          distance to the start coordinate (i.e., TSS) to determine closest.
+# Output:
+#   a dataframe providing closest feature corresponding to
+#   each region in input in sequence with two columns:
+#   feat_id and distance. If no feature, the corresponding row has '' on first column
+#   and NA on second column
+
+# Modified from function closestGene function in rUtils package, 1/26/2021
+
+closestFeat <- function(regions, ann, mode = 'start') {
+  
+  closFeat <- data.frame(feat_id = rep('', nrow(regions)), dist = rep(NA, nrow(regions)))
+  
+  for (iRow in 1:nrow(regions)) {
+    regChr <- regions[iRow, 1]
+    regStart <- regions[iRow, 2]
+    regEnd <- regions[iRow, 3]
+
+    annChr <- ann[ann[, 2] == regChr, ]
+    if (nrow(annChr) == 0) {
+      # there is no feature in the chromosome, skip
+      next
+    }
+    
+    if (mode == 'body') {
+      # check if there is feature overlapping with the region
+      ovlFeat <- annChr[(regStart >= annChr[, 3] & regStart < annChr[, 4]) |
+                        (regEnd > annChr[, 3] & regEnd <= annChr[, 4]) |
+                        (regStart <= annChr[, 3] & regEnd >= annChr[, 4]), ]
+      if (nrow(ovlFeat) > 0) {
+        # there is overlapping feature
+        closFeat$dist[iRow] <- 0
+        if (nrow(ovlFeat) == 1) closFeat[iRow, 1] <- ovlFeat[1, 1]
+        else {
+          # assign the feature having the largest overlap
+          ovl <- rep(0, nrow(ovlFeat))
+          identified <- FALSE
+          for (iF in 1:nrow(ovlFeat)) {
+            if ((regStart >= ovlFeat[iF, 3] && regEnd <= ovlFeat[iF, 4]) || # region within the feature
+                (regStart <= ovlFeat[iF, 3] && regEnd >= ovlFeat[iF, 4])) { # feature within the region
+              # !!! note here we assume only one gene can be within a region,
+              # if there is multiple, the first found is picked
+              closFeat[iRow, 1] <- ovlFeat[iF, 1]
+              identified <- TRUE
+              break
+            } else if (regStart < ovlFeat[iF, 3] && regEnd > ovlFeat[iF, 3]) {
+              ovl[iF] <- regEnd - ovlFeat[iF, 3]
+            } else if (regStart < ovlFeat[iF, 4] && regEnd > ovlFeat[iF, 4]) {
+              ovl[iF] <- ovlFeat[iF, 4] - regStart
+            }
+          }
+          if (!identified) {
+            closFeat[iRow, 1] <- ovlFeat[which.max(ovl), 1]
+          }
+        }
+        next
+      }
+  
+      # no overlapping feature
+      distMat <- cbind(abs(annChr[, 3] - regStart),
+                       abs(annChr[, 3] - regEnd),
+                       abs(annChr[, 4] - regStart),
+                       abs(annChr[, 4] - regEnd))
+      minDist <- rowMins(distMat)
+      iMin <- which.min(minDist)
+      closFeat[iRow, 1] <- annChr[iMin, 1]
+      closFeat$dist[iRow] <- minDist[iMin]
+    } else {
+      # by default, start based
+      distMat <- cbind(abs(annChr[, 3] - regStart),
+                    abs(annChr[, 3] - regEnd))
+      minDist <- rowMins(distMat)
+      iMin <- which.min(minDist)
+      closFeat[iRow, 1] <- annChr[iMin, 1]
+      closFeat$dist[iRow] <- minDist[iMin]
+    }
+  }
+  
+  names(closFeat)[1] <- names(ann)[1]  
+  return(closFeat)
+}
+
+# calculate correlation between peak accessibility and the expression of paired feature
+# by individual features
+# Input: pairing is assumed to be a dataframe with rownames identifying the peaks and having
+# at least two columns, with first column providing
+# the paired feature id, and the second column providing the distance 
+calcEPCorByPeak <- function(expData, accData, pairing, saveToFile = NULL) {
+  peakWithEFeat <- pairing[pairing[, 1] %in% rownames(expData), ]
+  accDataUse <- accData[rownames(peakWithEFeat), ]
+  expDataUse <- extractData(expData, peakWithEFeat[, 1])
+  
+  expGrpAve <- calcGrpAve(expDataUse, grpInCom, expSOfGrp)
+  # group average of accessibility data
+  # note, below expSGrps is there on purpose, to make sure the two datasets are aligned
+  accGrpAve <- calcGrpAve(accDataUse, grpInCom, accSOfGrp)
+  
+  # compute correlation
+  corr <- sapply(1:nrow(expGrpAve), function(x) {
+    return(cor(expGrpAve[x, ], accGrpAve[x, ], method = 'pearson'))
+  })
+  names(corr) <- rownames(peakWithEFeat)
+  
+  corrOfAll <- rep(0, nrow(pairing))
+  names(corrOfAll) <- rownames(pairing)
+  corrOfAll[names(corr)] <- corr
+  
+  corr <- data.frame(cor = corrOfAll, expressed = names(corrOfAll) %in% names(corr))
+  rownames(corr) <- names(corrOfAll)
+  
+  if (!is.null(saveToFile)) {
+    corrOut <- cbind(peak = rownames(corr), feat = pairing[rownames(corr), 1], 
+                     dist = pairing[rownames(corr), 2],  corr)
+    write.csv(corrOut, saveToFile, row.names = FALSE, quote = FALSE)
+  }
+  return(corr)
+}
+
+```
+
+```{r stat-utils}
+# to test the significance of the overlap between two sets
+# nOvl - the number of overlap between the two sets
+# nSet1 - number of observations in set1
+# nSet2 - number of observations in set2
+# nComm - number of total common observations in the two pools that set1 and set2 come from
+# nTtl1 - the number of observations in pool1 where set1 comes from
+# nTtl2 - the number of observations in pool2 where set2 comes from
+# value: a list, consisting of pv - the pvalue, ovl indicating whether the input
+#        overlap is above the mean overlap seen by random
+ovlTest <- function(nOvl, nSet1, nSet2, nComm, nTtl1, nTtl2) {
+  nRep <- 1000
+  
+  pool1 <- 1:nTtl1
+  pool2 <- c(1:nComm, (nTtl1 + 1):(nTtl1 + nTtl2 - nComm))
+  rndOvl <- sapply(1:nRep, function(x) {
+    set1 <- sample(pool1, nSet1)
+    set2 <- sample(pool2, nSet2)
+    return(length(which(set1 %in% set2)))
+  })
+  # hist(rndOvl) #approximately Gaussian
+  mu <- mean(rndOvl)
+  ovl <- nOvl >= mu
+  pv <- pnorm(nOvl, mean = mu, sd = sd(rndOvl))
+  pv[ovl] <- 1 - pv[ovl]
+  
+  return(list(pv = pv, ovl = ovl))
+}
+
+# calculate the overlap between two clustering and perform statistic test for the 
+# statistic significance of such overlap
+# Observation in multiple clusters in one clustering is allowed
+# clus1 - a named list, providing cluster assignment in first clustering
+# clus2 - a named list, providing cluster assignment in second clustering
+# nTtlObs1 - the total number of observations that the clus1 is resulted from. 
+#         the observations included in clus1 may be a subset of the total. 
+#         if not provided, the total number of observations included in clus1 is used
+# nTtlObs2 - the total number of observations that the clus2 is resulted from. 
+#         the observations included in clus2 may be a subset of the total. 
+#         if not provided, the total number of observations included in clus1 is used
+# nComm - out of the total, how many in common
+ovlOfClus <- function(clus1, clus2, nTtlObs1 = NULL, nTtlObs2 = NULL, nComm = NULL) {
+  if (is.null(nComm) || is.null(nTtlObs1)) {
+    obs1 <- unique(unlist(clus1))
+  }
+  
+  if (is.null(nComm) || is.null(nTtlObs2)) {
+    obs2 <- unique(unlist(clus2))
+  }
+  
+  if (is.null(nTtlObs1)) {
+    nTtlObs1 <- length(obs1)
+  }
+  if (is.null(nTtlObs2)) {
+    nTtlObs2 <- length(obs2)
+  }
+  if (is.null(nComm)) {
+    nComm <- length(which(obs1 %in% obs2))
+  }
+  
+  cntTbl <- matrix(rep(NA, length(clus1) * length(clus2)), nrow = length(clus1))
+  rownames(cntTbl) <- names(clus1)
+  colnames(cntTbl) <- names(clus2)
+  pv <- cntTbl
+  for (cls1 in names(clus1)) {
+    for (cls2 in names(clus2)) {
+      cntTbl[cls1, cls2] <- length(which(clus1[[cls1]] %in% clus2[[cls2]]))
+      pv[cls1, cls2] <- ovlTest(cntTbl[cls1, cls2], length(clus1[[cls1]]), length(clus2[[cls2]]),
+                    nComm = nComm, nTtl1 = nTtlObs1, nTtl2 = nTtlObs2)$pv
+    }
+  }
+  # calculate adjusted pvalue
+  pvAdj = matrix(p.adjust(as.vector(pv), method = 'fdr'), nrow = nrow(pv))
+  rownames(pvAdj) <- names(clus1)
+  colnames(pvAdj) <- names(clus2)
+  
+  return(list(cntTbl = cntTbl, pvTblRaw = pv, pvTblAdj = pvAdj))
+}
+
+```
+
+```{r plot-utils}
+subchunkify <- function(g, chnkLbl = NULL, figHeight=7, figWidth=5) {
+  g_deparsed <- paste0(deparse(
+    function() {g}
+  ), collapse = '')
+
+  if (is.null(chnkLbl)) {
+    chnkLbl <- paste0('sub_chunk_', floor(runif(1) * 10000))
+  }
+  
+  sub_chunk <- paste0("
+  `","``{r ", chnkLbl, ", fig.height=",
+   figHeight, ", fig.width=", figWidth, ", dev=c('png', 'pdf')}",
+  "\n(", 
+    g_deparsed
+    , ")()",
+  "\n`","``
+  ")
+
+  cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+}
+
+# colors used in heatmap
+getAccColFun <- function(zscore = TRUE) {
+  if (zscore) return(colorRamp2(c(-1, 0, 1), c("steelblue1", "black", "yellow")))
+  else return(colorRamp2(c(-5, -2, 3), c("steelblue1", "black", "yellow")))
+}
+
+getExpColFun <- function(zscore = TRUE) {
+  if (zscore) return(colorRamp2(c(-1, 0, 1), c("blue", "white", "red")))
+  else return(colorRamp2(c(-3, 0, 10), c("blue", "white", "red")))
+}
+
+getMetColFun <- function() {
+  return(colorRamp2(c(0.1, 0.4, 0.7), c("#f1eef6", "#74a9cf", "#034e7b")))
+}
+
+getMetNACol <- function() {
+  return('white')
+}
+
+getCpGColFun <- function() {
+  return(colorRamp2(c(10, 40, 80), c("#edf8e9", "#74c476", "#005a32")))
+}
+
+getEnrColFun <- function() {
+  return(colorRamp2(c(-2, 0, 1), c("blue", "white", "red")))
+}
+
+getFeatClusCol <- function() {
+  return(c('Low' = 'royal blue', 'Dynamic' = '#FF7F50', 'High' = '#9ACD32'))
+}
+
+# make concatenated heatmaps: RNA+ATAC+CpG
+# featByGrp: a list of sets of features included in the heatmap, 
+#         one set per group, including features labeled to the group
+# expGrp: expression sample groups included in the heatmap
+# accGrp: accessibility sample groups included in the heatmap
+# featByClus: a list, providing feature classification based on either expression or accessibility
+#            a different data type from anaDataType
+# anaDataType: the type of data (e.g., expression or accessibility) that were used to identify
+#            the features included in featByGrp
+# widthPerSamp: a value in (cm), to control the width of expression and accessibility block
+# featPairing: a dataframe with at least one column, which provides the pairing between features 
+#           in expData and accData. It is assumed features in accGrp represented by the rownames
+#           of this dataframe and the first column provides the features in expData
+combHeatmap <- function(featByGrp, expGrp = NULL, accGrp = NULL, featByClus = NULL, 
+                        expData = NULL, accData = NULL, cpgDens = NULL, anaDataType = 'exp',
+                        widthPerSamp = 0.4, saveToFile = NULL, featPairing = NULL) {
+  # pool all features included in the plot
+  feats <- NULL
+  for (grp in names(featByGrp)) {
+    feats <- c(feats, featByGrp[[grp]])
+  }
+  
+  # pool samples included in the accessibility block and 
+  # create x-axis label
+  accLbls <- NULL # accessibility block label
+  accSamps <- NULL # accessibility block samples
+  for (grp in accGrp) {
+    sampsInGrp <- getSampByGrp(grp, 'acc')
+    lbl <- rep('', length(sampsInGrp))
+    lbl[floor(length(sampsInGrp) / 2) + 1] <- getGrpLbl(grp, 'acc')
+    accLbls <- c(accLbls, lbl)
+    accSamps <- c(accSamps, sampsInGrp)
+  }
+  
+  # pool samples included in the expression block and 
+  # create x-axis label
+  expLbls <- NULL # expression block label
+  expSamps <- NULL # exppression block samples
+  for (grp in expGrp) {
+    sampsInGrp <- getSampByGrp(grp)
+    lbl <- rep('', length(sampsInGrp))
+    lbl[floor(length(sampsInGrp) / 2) + 1] <- getGrpLbl(grp, 'exp')
+    expLbls <- c(expLbls, lbl)
+    expSamps <- c(expSamps, sampsInGrp)
+  }
+  
+  # set accessibility and expression block width
+  accWidth <- length(accSamps) * widthPerSamp
+  expWidth <- length(expSamps) * widthPerSamp
+  
+  # sort features according to (1) accessibility/expression classification (low, dynamic, high), 
+  # (2) group that the feature assigned to, and (3) expression/accessibility in samples from the group 
+  # that the feature assigned to, in sequence
+  # Set promoter accessibility classification
+  featClus <- rep('Low', length(feats))
+  if (is.null(featPairing)) {
+    featClus[feats %in% featByClus$high] <- 'High'
+    featClus[feats %in% featByClus$dynamic] <- 'Dynamic'
+  } else {
+    featClus[featPairing[feats, 1] %in% featByClus$high] <- 'High'
+    featClus[featPairing[feats, 1] %in% featByClus$dynamic] <- 'Dynamic'
+  }
+  clusLbls <- c('Low', 'Dynamic', 'High')
+  
+  # Find the group that features assigned to
+  grpAssn <- NULL 
+  for (grp in names(featByGrp)) {
+    grpAssn <- c(grpAssn, rep(grp, length(featByGrp[[grp]])))
+  }
+  # Calculate the average expression in samples from the group feature assigned to
+  grpAve <- NULL
+  for (grp in names(featByGrp)) {
+    if (anaDataType == 'exp') {
+      sampsInGrp <- getSampByGrp(grp, 'exp')
+      grpAve <- c(grpAve, rowMeans(expData[featByGrp[[grp]], sampsInGrp, drop = FALSE]))
+    } else {
+      sampsInGrp <- getSampByGrp(grp, 'acc')
+      grpAve <- c(grpAve, rowMeans(accData[featByGrp[[grp]], sampsInGrp, drop = FALSE]))
+    }
+  }
+  
+  sortInfo <- data.frame(cbind(idx = 1:length(feats), 
+        clus = factor(featClus, levels = clusLbls, ordered = TRUE), 
+        grp = factor(grpAssn, levels = names(featByGrp), ordered = TRUE), 
+        ave = grpAve)) 
+  # sort according to ave, grp, clus in sequence
+  sortInfo <- sortInfo[sort(sortInfo$ave, decreasing = TRUE, index.return = TRUE)$ix, ]
+  sortInfo <- sortInfo[sort(sortInfo$grp, index.return = TRUE)$ix, ]
+  sortInfo <- sortInfo[sort(sortInfo$clus, index.return = TRUE)$ix, ]
+  
+  # ploting data
+  # note that there can be features that do not appear in accessibility data
+  # for those that do not, set their acc data to min. This is ok, because why they are not 
+  # here is because there is no overlapped read, refer to funciton extractData
+  plotAccMat <- extractData(accData[, accSamps], feats[sortInfo$idx])
+  
+  # similar to accessibility data. There can be features that do not appear in expression data
+  # Also, set them to min. 
+  if (is.null(featPairing)) {
+    plotExpMat <- extractData(expData[, expSamps], feats[sortInfo$idx])
+  } else {
+    plotExpMat <- extractData(expData[, expSamps], featPairing[feats[sortInfo$idx], 1])
+  }
+  
+  # CpG density data
+  plotCpgVec <- cpgDens[feats[sortInfo$idx]]
+  if (any(is.na(plotCpgVec))) {
+    # it is expected all features should CpG density being calculated
+    stop('There are features missing CpG density data')
+  }
+  
+  # annotations
+  if (max(table(featClus)) / min(table(featClus)) > 10) {
+    showRowAnnLegend <- TRUE
+  } else {
+    showRowAnnLegend <- FALSE
+  }
+  rowAnn <- rowAnnotation(Accessibility = clusLbls[sortInfo$clus], 
+      col = list(Accessibility = getFeatClusCol()), show_annotation_name = FALSE,
+      simple_anno_size = unit(0.2, "cm"), show_legend = showRowAnnLegend,
+      annotation_legend_param = list(title = ''))
+  colAnnExp <- HeatmapAnnotation(grp = anno_text(expLbls, rot = 45))
+  colAnnAcc <- HeatmapAnnotation(grp = anno_text(accLbls, rot = 45))
+  
+  ht_opt$message = FALSE
+  if (showRowAnnLegend) {
+    accHMap <- Heatmap(plotAccMat, name = 'acc', column_title = 'Accessibility', col = getAccColFun(),
+      cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, 
+      show_column_names = FALSE, 
+      split = factor(clusLbls[sortInfo$clus], levels = clusLbls),
+      left_annotation = rowAnn, row_title_gp = gpar(fontsize = 12), 
+      bottom_annotation = colAnnAcc,  column_title_gp = gpar(fontsize = 12),
+      row_title = NULL, # do not show row title
+      width = unit(accWidth, 'cm'), heatmap_legend_param = list(at = c(-1, 0, 1), title = ''))
+  } else {
+    accHMap <- Heatmap(plotAccMat, name = 'acc', column_title = 'Accessibility', col = getAccColFun(),
+      cluster_rows = FALSE, cluster_columns = FALSE, show_row_names = FALSE, 
+      show_column_names = FALSE, 
+      split = factor(clusLbls[sortInfo$clus], levels = clusLbls),
+      left_annotation = rowAnn, row_title_gp = gpar(fontsize = 12), 
+      bottom_annotation = colAnnAcc,  column_title_gp = gpar(fontsize = 12),
+      # row_title = NULL, # show row title
+      width = unit(accWidth, 'cm'), heatmap_legend_param = list(at = c(-1, 0, 1), title = ''))
+  }
+  expHMap <- Heatmap(plotExpMat, name = 'exp', column_title = 'Expression', cluster_rows = FALSE, 
+      cluster_columns = FALSE, show_column_names = FALSE, show_row_names = FALSE,
+      col = getExpColFun(), width = unit(expWidth, 'cm'),
+      bottom_annotation = colAnnExp,  column_title_gp = gpar(fontsize = 12),
+      heatmap_legend_param = list(at = c(-1, 0, 1), title = ''))
+  cpgHMap <- Heatmap(plotCpgVec, name = 'cpg', column_title = 'CpG', cluster_rows = FALSE,
+      cluster_columns = FALSE, show_column_names = FALSE, show_row_names = FALSE,
+      col = getCpGColFun(), column_title_gp = gpar(fontsize = 12),
+      width = unit(5, 'mm'), heatmap_legend_param = list(at = c(10, 40, 80), title = ''))
+  
+  p <- accHMap + expHMap + cpgHMap
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste0(saveToFile, ".pdf"), width = 6.5, height = 5)
+    draw(p)
+    # grid.rect(gp=gpar(fill=NA))
+    dev.off()
+  }
+  
+  return(p)
+  # draw(p)
+}
+
+# histogram of correlation
+plotCorr <- function(corr, title = NULL, saveToFile = NULL) {
+  nBins <- 100
+  nLowTicks <- 5
+  nUpTicks <- 1
+  
+  df <- data.frame(corr = corr)
+  p <- ggplot(df, aes(x = corr)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+    theme_classic()  +
+    theme(axis.text.x = element_text(size = 12), 
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = 'Correlation', y = 'Frequency')
+  if (length(corr) == 0) {
+    p <- p + theme(axis.line = element_blank())
+  }
+  
+  if (length(corr) > 20) { # hard code 20, which may be not a good number
+    binCnts <- ggplot_build(p)$data[[1]]$count
+    topTwo <- sort(binCnts, decreasing = TRUE)[1:2]
+    if (topTwo[2] > nLowTicks && topTwo[1] / 2 > topTwo[2]) {
+      tickWith <- floor(topTwo[2] / nLowTicks)
+      tickWith <- (as.numeric(substr(tickWith, 1, 1)) + 1) * (10 ^ (nchar(tickWith) - 1))
+      
+      segUp <- floor(topTwo[1] / tickWith) * tickWith
+      if (segUp == topTwo[1]) {
+        segUp <- segUp - tickWith
+        nUpTicks <- 2
+      }
+      
+      yUpLim <- ceiling(topTwo[1] / tickWith) * tickWith
+      # if (yUpLim == topTwo[1]) {
+      #   yUpLim <- yUpLim + tickWith
+      #   nUpTicks <- 2
+      # }
+      
+      p <- gg.gap(p, ylim = c(0, yUpLim), 
+                  segments = c(tickWith * nLowTicks, segUp),
+                  tick_width = c(tickWith, tickWith), 
+                  rel_heights = c(nLowTicks / (nLowTicks + nUpTicks), 0, nUpTicks / (nLowTicks + nUpTicks)),
+                  margin = c(top = 0, right = 0, bottom = 0, left = 1))
+    }
+  }
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width=6, height=4)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+    
+  if (!is.null(title)) {
+    p <- p + ggtitle(title) + 
+      theme(plot.title = element_text(hjust = 0.5)) 
+  }
+  
+  return(p)
+}
+
+# plot correlation by CpG density
+plotCorrByCD <- function(corr, clusByCD, saveToDir = NULL) {
+  grobs <- list()
+  
+  saveToFile <- NULL
+  if (!is.null(saveToDir)) {
+    setting <- c('all', 'low', 'medium', 'high')
+    saveToFile <- paste(figSubDir, setting, sep = '/')
+    names(saveToFile) <- setting
+  }
+  
+  grobs[[1]] <- plotCorr(corr, 
+                       title = sprintf('All (N=%s, %.2f%% [cor>0.5])', 
+                                       printNum(length(corr)), 
+                                       length(which(corr > 0.5)) * 100 / length(corr)),
+                         saveToFile = paste0(figSubDir, '/all')) +
+     theme(axis.title.x = element_blank())
+  
+  corrOfLow <- corr[names(corr) %in% clusByCD$low]
+  grobs[[2]] <- plotCorr(corrOfLow, 
+                         title = sprintf('Low (N=%s, %.2f%% [cor>0.5])', 
+                                       printNum(length(corrOfLow)), 
+                                       length(which(corrOfLow > 0.5)) * 100 / length(corrOfLow)),
+                         saveToFile = saveToFile['low']) +
+     theme(axis.title.y = element_blank(), axis.title.x = element_blank())
+  
+  corrOfMedium <- corr[names(corr) %in% clusByCD$medium]
+  grobs[[3]] <- plotCorr(corrOfMedium, 
+                         title = sprintf('Medium (N=%s, %.2f%% [cor>0.5])', 
+                                       printNum(length(corrOfMedium)), 
+                                       length(which(corrOfMedium > 0.5)) * 100 / length(corrOfMedium)),
+                         saveToFile = saveToFile['medium'])
+  
+  corrOfHigh <- corr[names(corr) %in% clusByCD$high]
+  # browser()
+  grobs[[4]] <- plotCorr(corrOfHigh, 
+                         title = sprintf('High (N=%s, %.2f%% [cor>0.5])', 
+                                       printNum(length(corrOfHigh)), 
+                                       length(which(corrOfHigh > 0.5)) * 100 / length(corrOfHigh)),
+                         saveToFile = saveToFile['high'])  +
+     theme(axis.title.y = element_blank())
+  grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+}
+
+
+# histogram of log10 TPM
+# Can also be used to plot quantification in other units, such as FPKM and FPM, by using the unit parameter
+plotLogOfTpm <- function(tpm, title = NULL, saveToFile = NULL, unit = 'TPM') {
+  nBins <- 100
+  nLowTicks <- 5
+  
+  df <- data.frame(tpm = log10(c(tpm + minTpm / 10)))
+  p <- ggplot(df, aes(x = tpm)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = nBins) +
+    theme_classic() + 
+    theme(axis.text.x = element_text(size = 12),
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = TeX(sprintf('Log$_{10}$(%s)', unit)), y = 'Frequency') 
+  
+  expression(paste0("Log[10]'(", unit, ")'"))
+  
+  binCnts <- ggplot_build(p)$data[[1]]$count
+  topTwo <- sort(binCnts, decreasing = TRUE)[1:2]
+  if (topTwo[1] / 2 > topTwo[2]) {
+    tickWith <- floor(topTwo[2] / nLowTicks)
+    tickWith <- (as.numeric(substr(tickWith, 1, 1)) + 1) * (10 ^ (nchar(tickWith) - 1))
+    p <- gg.gap(p, ylim = c(0, ceiling(topTwo[1] / tickWith) * tickWith), 
+                segments = c(tickWith * nLowTicks, floor(topTwo[1] / tickWith) * tickWith),
+                tick_width = c(tickWith, tickWith),
+                rel_heights = c(nLowTicks / (nLowTicks + 1), 0, 1 / (nLowTicks + 1)),
+                margin = c(top = 0, right = 0, bottom = 0, left = 1))
+  }
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width=6, height=4)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+  
+  if (!is.null(title)) {
+    p <- p + ggtitle(title) + 
+      theme(plot.title = element_text(hjust = 0.5)) 
+  } 
+  
+  return(p)
+}
+
+plotCpGDens <- function(dens, title = NULL, saveToFile = NULL) {
+  df <- data.frame(dens = log2(dens + 1))
+  p <- ggplot(df, aes(x = dens)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+    theme_classic()  + 
+    theme(axis.text.x = element_text(size = 12), 
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = expression(Log[2]~'(Density + 1)'), y = 'Frequency') 
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width=6, height=4)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+    
+  if (!is.null(title)) {
+    p <- p + ggtitle(title) + 
+      theme(plot.title = element_text(hjust = 0.5))
+  } 
+  
+  return(p)
+}
+
+# scatter plot of expression and accessibility
+# it is assumed that rows in expData and accData are exactly line up
+# sampGrps: sample groups included in the plot
+# featByCpGDens: clustering of features according to cpg density
+# featType: 'acc' or 'exp', indicates the feature in featByCpGDens is feature in accData
+#           or expData. Note when features in accData are promoters, the features in these two
+#           datasets are consistent. However, it is not the case when the features in accData
+#           are peaks
+# fGrpAssn: providing the assignment of features to sample group labels, 
+#           when this is provided, each plot only includes features that are 
+#           labeled to the corresponding sample group
+# minNDataPoints: minimum number of data points required to plot, default 5
+plotExpAndAcc <- function(expData, accData, sampGrps, featByCpGDens = promByCpGDens, 
+          fGrpAssn = NULL, featType = 'acc', frac = 1, minNDataPoints = 5, saveToFile = NULL) {
+  
+  plotTpm <- function(plotDm, pointColor = NULL) {
+  
+    findBreaks <- function(val) {
+      dist <- max(val) - min(val)
+      if (dist < 4) intv <- 1
+      else if (dist < 6) intv <- 2
+      else if (dist < 10) intv <- 3
+      else intv <- 5
+      
+      if (intv > 3) {
+        breaks <- round(min(val)) + 1
+      } else {
+        breaks <- round(min(val)) + intv
+      }
+      
+      while (breaks[length(breaks)] + intv < max(val)) {
+        breaks <- c(breaks, breaks[length(breaks)] + intv)
+      }
+      
+      return(breaks)
+    }
+    
+    xBreaks <- findBreaks(plotDm$exp)
+    yBreaks <- findBreaks(plotDm$acc)
+    
+    p <- ggplot(plotDm, aes(x = exp, y = acc))
+    
+    if (!is.null(pointColor)) {
+      p <- p + geom_point(size = 0.05, color = pointColor)
+    } else {
+      p <- p + geom_point(size = 0.05)
+    }
+    
+    p <- p + theme_classic() + 
+      theme(axis.title = element_blank(), 
+            plot.title = element_text(hjust = 0.5)) +
+      ggtitle(sprintf('R = %.2f', cor(plotDm$acc, plotDm$exp))) +
+      scale_x_continuous(breaks = xBreaks) +
+      scale_y_continuous(breaks = yBreaks)
+      # scale_x_continuous(breaks = xBreaks, limits = xLimits) +
+      # scale_y_continuous(breaks = yBreaks, limits = yLimits) +
+      # annotate('text', x = xAnn, y = yAnn, 
+      #           label = sprintf('R = %.2f', cor(plotDm$acc, plotDm$exp)))
+    
+    return(p)
+  }
+  
+  grobs <- list()
+  for (iGrp in 1:length(sampGrps)) {
+    grp <- sampGrps[iGrp]
+    
+    # prepare data
+    if (is.null(fGrpAssn)) {
+      # use all features in the plot
+      expOfGrp <- expData[, getSampByGrp(grp, data = 'exp')]
+      accOfGrp <- accData[, getSampByGrp(grp, data = 'acc')]
+    } else {
+      # use features assigned to the group
+      if (featType == 'exp') {
+        iSel <- rownames(expData) %in% names(fGrpAssn)[fGrpAssn == grp]
+      } else if (featType == 'acc') {
+        iSel <- rownames(accData) %in% names(fGrpAssn)[fGrpAssn == grp]
+      }
+      expOfGrp <- expData[iSel, getSampByGrp(grp, data = 'exp')]
+      accOfGrp <- accData[iSel, getSampByGrp(grp, data = 'acc')]
+    }
+    # compute the mean    
+    if (is.null(ncol(expOfGrp))) {
+      # only data for one sample, no mean needs to be calculated
+      expAve <- log2(expOfGrp + frac)
+    } else {
+      expAve <- log2(rowMeans(expOfGrp) + frac)
+    }
+    if (is.null(ncol(accOfGrp))) {
+      accAve <- log2(accOfGrp + frac)
+    } else {
+      accAve <- log2(rowMeans(accOfGrp) + frac)
+    }
+    
+    # all features
+    plotFm <- data.frame(acc = accAve, exp = expAve)
+    if (nrow(plotFm) >= minNDataPoints) {
+      grobs[[(iGrp - 1) * 4 + 1]] <- plotTpm(plotFm)
+    } else {
+      grobs[[(iGrp - 1) * 4 + 1]] <- grid.rect(gp=gpar(col="white"))
+    }
+   
+    # Genes with low promoter CpG density
+    if (featType == 'exp') {
+      iSel <- rownames(expOfGrp) %in% featByCpGDens$low
+    } else if (featType == 'acc') {
+      iSel <- rownames(accOfGrp) %in% featByCpGDens$low
+    }
+    plotFm <- data.frame(acc = accAve[iSel], exp = expAve[iSel])
+    if (nrow(plotFm) >= minNDataPoints) {
+      grobs[[(iGrp - 1) * 4 + 2]] <- plotTpm(plotFm, pointColor = 'blue')
+    } else {
+      grobs[[(iGrp - 1) * 4 + 2]] <- grid.rect(gp=gpar(col="white"))
+    }
+  
+    # Genes with medium promoter CpG density
+    if (featType == 'exp') {
+      iSel <- rownames(expOfGrp) %in% featByCpGDens$medium
+    } else if (featType == 'acc') {
+      iSel <- rownames(accOfGrp) %in% featByCpGDens$medium
+    }
+    plotFm <- data.frame(acc = accAve[iSel], exp = expAve[iSel])
+    if (nrow(plotFm) >= minNDataPoints) {
+      grobs[[(iGrp - 1) * 4 + 3]] <- plotTpm(plotFm, pointColor = 'orange')
+    } else {
+      grobs[[(iGrp - 1) * 4 + 3]] <- grid.rect(gp=gpar(col="white"))
+    }
+  
+    # Genes with high promoter CpG density
+    if (featType == 'exp') {
+      iSel <- rownames(expOfGrp) %in% featByCpGDens$high
+    } else if (featType == 'acc') {
+      iSel <- rownames(accOfGrp) %in% featByCpGDens$high
+    }
+    plotFm <- data.frame(acc = accAve[iSel], exp = expAve[iSel])
+    if (nrow(plotFm) >= minNDataPoints) {
+      grobs[[(iGrp - 1) * 4 + 4]] <- plotTpm(plotFm, pointColor = 'red')
+    } else {
+      grobs[[(iGrp - 1) * 4 + 4]] <- grid.rect(gp=gpar(col="white"))
+    }
+  }
+  
+  arrGrobs <- rbind(tableGrob(t(c('All', 'Low CpG', 'Medium CpG', 'High CpG')), 
+                              theme = ttheme_minimal(base_size = 10), row = ''),
+                    cbind(tableGrob(sampGrps, 
+                                    theme = ttheme_minimal(base_size = 10, 
+                                              core=list(fg_params=list(hjust=1, x=0.9)))),
+                          arrangeGrob(grobs = grobs, ncol = 4),  size = "last"), size = "last")
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width = 5, height = ceiling(length(sampGrps) * (5 / 4)))
+    grid.arrange(arrGrobs, bottom = 'Expression TPM (log2)', right = 'Accessibility TPM (log2)')
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+  
+  p <- arrangeGrob(arrGrobs, bottom = 'Expression TPM (log2)', right = 'Accessibility TPM (log2)')
+  return(p)
+}
+
+# clus1 and clus2: named lists, providing the cluster assignment for the two clusterings. 
+#                  the name of each name is use as the cluster name. 
+# outDir: the folder that the results (count and pvalue tables, and overlapping gene list) are saved to
+# figToFile: prefix (including full path and file name except extension) 
+#           of the file for saving the figure. If not given,figure is not saved
+# pT: pv threshold used to call significance in cluster overlapping
+#    Only overlapping features between two significantly overlapping clusters are saved
+# excFromClus1 - a vector of names of clusters in clustering 1 (i.e., clus1) to be excluded from plotting
+# excFromClus2 - a vector of names of modules in module set 2 to be excluded from plotting
+# xLblRot - boolean, whether to rotate x labels to 45 degree
+
+# In both heatmap and count (and pvalue) table, rows represent clusters in clus1
+# and columns represent clusters in clus2
+featClusOvl <- function(clus1, clus2, outDataDir = NULL, outFigDir = NULL, nTtlObs1 = NULL, 
+                        nTtlObs2 = NULL, nComm = NULL, pT = 0.05,
+                       excFromClus1 = NULL, excFromClus2 = NULL,
+                       fontsize = 12, fontsizeNumber = 12, angleCol = '90',
+                       anno = NULL, minPlotPv = 10 ^ (-20)) {
+  
+  plotHeatmap <- function(plotData, dataType = 'pv', saveToFile = NULL, minPlotPv = 10 ^ (-20)) {
+    # filter out clusters from heatmap as specified
+    if (!is.null(excFromClus1)) {
+      plotData <- plotData[!(rownames(plotData) %in% excFromClus1), ]
+    }
+    if (!is.null(excFromClus1)) {
+      plotData <- plotData[,!(colnames(plotData) %in% excFromClus2) ]
+    }
+    
+    color <- colorRampPalette(c("white", "firebrick3"))(50)
+    breaks <- NA
+    
+    if (dataType == 'pv') {
+      # set 0 to be the smallest non-zero
+      if (length(which(plotData > 0)) == 0) {
+        # all pvs are zeros, set to the minPlotPv
+        plotData[plotData == 0] <- minPlotPv
+        breaks <- seq(0, -log10(minPlotPv), length.out = length(color) + 1)
+        put(sprintf('#color = %d and #breaks = %d', length(color), length(breaks)))
+      } else {
+        plotData[plotData == 0] <- max(min(plotData[plotData > 0]), minPlotPv)
+      }
+      
+      plotData <- -1 * log10(plotData)
+      numberFormat <- '%.2f'
+    } else if (dataType == 'cnt') {
+      numberFormat <- '%d'
+    }
+    
+    # breaks
+    p <- pheatmap(plotData,
+             color = color, breaks = breaks,
+             cluster_rows = FALSE, cluster_cols = FALSE, display_numbers = TRUE,
+             number_format = numberFormat, fontsize = fontsize, 
+             fontsize_number = fontsizeNumber, angle_col = angleCol)
+    
+    return(p)
+  }
+  
+  ovlTbl <- ovlOfClus(clus1, clus2, nTtlObs1 = nTtlObs1, 
+                      nTtlObs2 = nTtlObs2, nComm = nComm) # overlapping test
+
+  if (!is.null(outDataDir)) {
+    # save data
+    write.csv(ovlTbl$cntTbl, file = paste0(outDataDir, '/ovl-cnt.csv'))
+    write.csv(ovlTbl$pvTblRaw, file = paste0(outDataDir, '/ovl-raw-pv.csv'))
+    write.csv(ovlTbl$pvTblAdj, file = paste0(outDataDir, '/ovl-adj-pv.csv'))
+  
+    # save the overlapping feat list
+    if (!dir.exists(paste0(outDataDir, '/ovl-feat'))){
+      dir.create(paste0(outDataDir, '/ovl-feat'))
+    } 
+    useIdx <- which(ovlTbl$pvTblAdj < pT, arr.ind = TRUE)
+    for (i in 1:nrow(useIdx)) {
+      featCls1 <- clus1[[names(clus1)[useIdx[i, 1]]]]
+      featCls2 <- clus2[[names(clus2)[useIdx[i, 2]]]]
+      featList <- featCls1[featCls1 %in% featCls2]
+      
+      saveToFile <- sprintf('%s/ovl-feat/row%d-col%d.csv',
+                                           outDataDir, useIdx[i, 1], useIdx[i, 2])
+      if (!is.null(featList)) {
+        write.csv(cbind(featList, anno[featList, ]), saveToFile, row.names = FALSE,
+                  quote = FALSE)
+      } else {
+        write.table(featList, saveToFile, row.names = FALSE, col.names = FALSE)
+      }
+    }
+  }
+  
+  # plotting
+  # plot pvalue
+  pvPlot <- plotHeatmap(ovlTbl$pvTblAdj, minPlotPv = minPlotPv)
+  cntPlot <- plotHeatmap(ovlTbl$cntTbl, dataType = 'cnt')
+  
+  
+  return(list(pvPlot = pvPlot, cntPlot = cntPlot))
+}
+
+# plot peak-feature distance
+plotPFDist <- function(dist, title = NULL, saveToFile = NULL) {
+  df <- data.frame(dist = log10(dist))
+  p <- ggplot(df, aes(x = dist)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+    theme_classic()  + 
+    theme(axis.text.x = element_text(size = 12), 
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = expression(Log[10]~'(Distance)'), y = 'Frequency') 
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width = 6, height = 4)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+    
+  if (!is.null(title)) {
+    p <- p + ggtitle(title) + 
+      theme(plot.title = element_text(hjust = 0.5))
+  } 
+  
+  return(p)
+}
+
+# plot motif enrichment and gene expression
+# Modified from function motifEnrGP in distal.Rmd, bovine-atac
+# Inputs: enrData and rnaData are two data matrix with row names and column names. In both matrices
+# rows represent genes and columns represent sample. The samples in the two matrices are
+# expected to be exactly same and aligned. 
+plotMEnrAndGExp <- function(enrData, rnaData) {
+  samps <- colnames(rnaData)
+  ptSizeScale <- c('<5' = 1, '10' = 2, '50' = 3, '150' = 4, '300' = 5, '600' = 6, '>600' = 7)
+  ptSizeLabel <- names(ptSizeScale)
+  names(ptSizeLabel) <- ptSizeScale
+  plotDm <-  NULL
+  for (iS in 1:length(samps)) {
+    samp <- samps[iS]
+    
+    enr <- rep(0, nrow(enrData))
+    enr[enrData[, samp] < 5] <- ptSizeScale['<5']
+    enr[enrData[, samp] >= 5 & enrData[, samp] <= 10] <- ptSizeScale['10']
+    enr[enrData[, samp] > 10 & enrData[, samp] <= 50] <- ptSizeScale['50']
+    enr[enrData[, samp] > 50 & enrData[, samp] <= 150] <- ptSizeScale['150']
+    enr[enrData[, samp] > 150 & enrData[, samp] <= 300] <- ptSizeScale['300']
+    enr[enrData[, samp] > 300 & enrData[, samp] <= 600] <- ptSizeScale['600']
+    enr[enrData[, samp] > 600] <- ptSizeScale['>600']
+    
+    rna <- rep('', nrow(enrData))
+    rna[rnaData[, samp] == 0] <- 'c0'
+    rna[rnaData[, samp] > 0 & rnaData[, samp] <= 5] <- 'c5'
+    rna[rnaData[, samp] > 5 & rnaData[, samp] <= 10] <- 'c10'
+    rna[rnaData[, samp] > 10 & rnaData[, samp] <= 20] <- 'c20'
+    rna[rnaData[, samp] > 20 & rnaData[, samp] <= 40] <- 'c40'
+    rna[rnaData[, samp] > 40 & rnaData[, samp] <= 80] <- 'c80'
+    rna[rnaData[, samp] >= 80] <- 'c>80'
+    
+    plotDm <- rbind(plotDm, data.frame(tf = nrow(enrData):1,
+                                    samp = rep(iS, nrow(enrData)),
+                                    enr = enr[nrow(enrData):1],
+                                    rna = rna[nrow(enrData):1]))
+  }
+  plotDm$rna <- factor(plotDm$rna, c('c0', 'c5', 'c10', 'c20', 'c40', 'c80', 'c>80'))
+  p <- ggplot(plotDm, aes(x = samp, y = tf, color = rna, size = enr)) + 
+    geom_point() +
+    scale_x_continuous(breaks = 1:length(samps), labels = samps, limits = c(1, length(samps))) +
+    scale_y_continuous(breaks = 1:nrow(enrData), labels = rownames(enrData)) +
+    scale_color_manual(labels = c('c0' = '0', 'c5' = '5', 'c10' = '10', 'c20' = '20', 'c40' = '40', 'c80' = '80', 'c>80' = '>80'),
+                       # values = c('c0' = '#2166ac', 'c5' = '#67a9cf', 'c10' = '#d1e5f0', 'c20' = '#f7f7f7', 
+                       #            'c40' = '#fddbc7', 'c80' = '#ef8a62', 'c>80' = '#b2182b'),
+                       values = c('c0' = '#fee5d9', 'c5' = '#fcbba1', 'c10' = '#fc9272', 'c20' = '#fb6a4a',
+                                  'c40' = '#ef3b2c', 'c80' = '#cb181d', 'c>80' = '#99000d')
+                       # values = c('c0' = '#4575b4', 'c5' = '#91bfdb', 'c10' = '#e0f3f8', 'c20' = '#ffffbf', 
+                       #            'c40' = '#fee090', 'c80' = '#fc8d59', 'c>80' = '#d73027')
+                       ) +
+    scale_size_continuous(breaks = ptSizeScale[ptSizeScale %in% plotDm$enr],
+                          labels = ptSizeLabel[ptSizeScale %in% plotDm$enr]) +
+    labs(color = 'TPM', size = '-log P') + theme_bw() +
+    theme(axis.ticks = element_blank(), axis.title = element_blank(),
+          panel.border = element_blank(), panel.grid = element_blank(),
+          axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1.2),
+          legend.box = 'horizontal')
+  return(p)
+}
+
+# wrapper function of plotMEnrAndGExp
+# this function directly takes in raw motif enrichment data frame and expression data matrix
+# which contains all genes
+# tfToPlot -- TFs included in the plot
+plotMEAndGE <- function(motEnr, expData) {
+  enrPlotData <- data.matrix(motEnr[, 3:ncol(motEnr)]) 
+  rownames(enrPlotData) <- motEnr$gene
+  
+  # sort the motifs according to max enrichment and the sample the max being observed
+  sortInfo <- data.frame(idx = 1:nrow(enrPlotData),
+                         samp = apply(enrPlotData, 1, which.max),
+                         enr = apply(enrPlotData, 1, max))
+  sortInfo <- sortInfo[sort(sortInfo$enr, decreasing = TRUE, index.return = TRUE)$ix, ]
+  sortInfo <- sortInfo[sort(sortInfo$samp, index.return = TRUE)$ix, ]
+  enrPlotData <- enrPlotData[sortInfo$idx, ]
+  
+  expPlotData <- expData[rownames(anno)[match(rownames(enrPlotData), toupper(anno$gene_symbol))], ]
+  rownames(expPlotData) <- rownames(enrPlotData)
+  
+  
+  p <- plotMEnrAndGExp(enrPlotData, expPlotData)
+  return(p)
+}
+```

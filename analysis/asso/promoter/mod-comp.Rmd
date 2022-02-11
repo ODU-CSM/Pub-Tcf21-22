@@ -1,0 +1,54 @@
+
+## Cross comparison between co-expressed `r feature` modules and co-accessible promoter modules. 
+
+```{r mod-comp} 
+modCmpDir <- paste0(output, '/mod-cmp')
+if (!dir.exists(modCmpDir)) dir.create(modCmpDir)
+modCmpFigDir <- paste0(modCmpDir, '/figures')
+if (!dir.exists(modCmpFigDir)) dir.create(modCmpFigDir)
+
+# collect expression module
+expModAssn <- list()
+for (modId in names(expMod$moduleNames)) {
+  if (max(expMod$modGrpCor$cor[expMod$moduleNames[modId], ]) < minEModCor) {
+    # if the max correlation associated with this module is less than the given 
+    # threshold, no analysis
+    next
+  }
+  expModAssn[[expMod$moduleNames[modId]]] <- 
+    expMod$featList[expMod$moduleLabels == expMod$moduleLabelOrdered[modId]]
+}
+
+# collect co-accessibility module
+accModAssn <- list()
+for (modId in names(accMod$moduleNames)) {
+  if (max(accMod$modGrpCor$cor[accMod$moduleNames[modId], ]) < minEModCor) {
+    # if the max correlation associated with this module is less than the given 
+    # threshold, no analysis
+    next
+  }
+  accModAssn[[accMod$moduleNames[modId]]] <- 
+    accMod$featList[accMod$moduleLabels == accMod$moduleLabelOrdered[modId]]
+}
+
+ovlTbl <-featClusOvl(expModAssn, accModAssn, outDataDir = modCmpDir, outFigDir = modCmpFigDir,
+            nTtlObs1 = nrow(expUse), nTtlObs2 = nrow(accUse), anno = anno,
+            nComm = length(which(rownames(expUse) %in% rownames(accUse))), 
+            angleCol = '45')
+```
+
+The files resulted from the analysis in this section can be found under folder *mod-cmp*, including the figures which were saved to the *figures* subfolder.  The overlapping between the two modules in each pairwise comparison was computed. For each calculated overlap, a statistic test was performed to evaluate that how likely the overlap happens by random. As a result, a p-value was obtained. The smaller the p-value is, the less likely the overlap happens in random. The overlap count table, tested raw p-values and the adjusted p-values (FDR) were saved to files: *ovl-cnt.csv*, *ovl-raw-pv.csv* and *ovl-adj-pv.csv*. In these files, the rows represent `r feature` co-expression modules; while the columns represent co-accessibility modules. The overlap count table and the adjusted p-value table were plotted in the following two heatmaps.
+
+Heatmap of overlap count table (*ovl-cnt.pdf*)
+
+```{r ovl-cnt, fig.width=6.5, fig.height=5, dev=c('png', 'pdf')}
+ovlTbl$cntPlot
+```
+
+Heatmap of adjust p-values (*ovl-pv-adj.pdf*)
+
+```{r ovl-pv-adj, fig.width=6.5, fig.height=5, dev=c('png', 'pdf')}
+ovlTbl$pvPlot
+```
+
+The overlapping `r feature`s from each pairwise comparison where the overlapping is statistically significant (adjusted p-value < 0.05) were save to folder *ovl-gene*. In this folder, all files follow a format row[$i$]-col[$j$].csv, with $i$ and $j$ referring to the $i$-th row and $j$-th column, respectively, in the count table. 

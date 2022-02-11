@@ -1,0 +1,31 @@
+
+```{r aln-data}
+accSampCom <- unlist(accSOfGrp[grpInCom])
+expSampCom <- unlist(expSOfGrp[grpInCom])
+accUseCom <- accUse[, accSampCom]
+# remove inaccessible
+accUseCom <- accUseCom[apply(accUseCom, 1, function(x) return(length(which(x >= minTpm)) > 0)), ]
+expUseCom <- expUse[, expSampCom]
+# remove unexpressed
+expUseCom <- expUseCom[apply(expUseCom, 1, function(x) return(length(which(x >= minTpm)) > 0)), ]
+# peak data
+peakTpmCom <- peakTpm[, accSampCom]
+
+# compose the full data of feature expression and promoter accessibility
+allFeatsCom <- unique(c(rownames(expUseCom), rownames(accUseCom)))
+accFullCom <- extractData(accUseCom, allFeatsCom)
+expFullCom <- extractData(expUseCom, allFeatsCom)
+
+# calculate group average
+accGrpAveCom <- calcGrpAve(accFullCom, grpInCom, accSOfGrp)
+expGrpAveCom <- calcGrpAve(expFullCom, grpInCom, expSOfGrp)
+
+# normalize each row in the data to have mean 0 and std 1
+expNormCom <- zscore(expUseCom)
+accNormCom <- zscore(accUseCom)
+peakNormCom <- zscore(peakTpmCom)
+```
+
+There are `r length(grpInCom)` sample groups in common between the two types of data, which are `r printNames(grpInCom)`. Only data from these groups will be used in subsequent analyses where paired data are required, for example, the computation of correlation between promoter accessibility and `r feature` expression. In these analyses, `r feature`s (and promoters) that were not expressed (accessible) in any sample (with a TPM $\ge$ `r minTpm`) from the shared groups will be excluded. 
+
+

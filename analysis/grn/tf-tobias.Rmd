@@ -1,0 +1,267 @@
+
+```{r tobias-setup}
+loc <- list() # for holding all local variables to facilitate clean up at the end
+loc$tbDtcStatFile <- paste0(inputParams$binDetectDir, '/bindetect_results.txt')
+loc$tfToIncFile <- inputParams$tfToInc
+```
+
+```{r load-tfBnd, warning=FALSE}
+loc$tbDtcStat <- read.table(loc$tbDtcStatFile, sep = '\t', header = TRUE)
+loc$nMtfWithRs <- nrow(loc$tbDtcStat)
+if (!is.null(loc$tfToIncFile)) {
+  # retain only TFs in the given .jaspar file in subsequent analysis
+  loc$tfToInc <- strsplit(substring(grep('^>.*', read.table(loc$tfToIncFile, sep = ',')$V1, 
+                                         value = TRUE, perl = TRUE), 2), split = '\t')
+  loc$tfToInc <- data.frame(matrix(unlist(loc$tfToInc), nrow = length(loc$tfToInc), byrow = TRUE))
+  names(loc$tfToInc) <- c('motif_id', 'name')
+  loc$tbDtcStat <- loc$tbDtcStat[loc$tbDtcStat$motif_id %in% loc$tfToInc$motif_id, ]
+}
+```
+
+```{r print-filtering}
+printFiltering <- function() {
+  return(sprintf(paste0('There are %d motifs included in the given *tfToInc* file, ',
+                        'of which %d have binding detection results. These motifs ',
+                        'will be used in the subsequent analysis.'), 
+                 nrow(loc$tfToInc), nrow(loc$tbDtcStat)))
+}
+```
+
+There are TF binding detection results from running TOBIAS for a total of `r printNum(loc$nMtfWithRs)` motifs. `r if (!is.null(loc$tfToIncFile)) printFiltering()`
+
+```{r tb-prep}
+loc$dtcTB <- NULL # for gathering detected TF binding
+for (iRow in 1:nrow(loc$tbDtcStat)) {
+  tfNames <- strsplit(loc$tbDtcStat$name[iRow], split = '::')[[1]]
+  for (tn in tfNames) {
+    sfxStart <- gregexpr('\\(', tn)[[1]][1]
+    if (sfxStart !=  -1) {
+      tn <- substr(tn, 1, sfxStart - 1)
+    }
+    loc$dtcTB <- rbind(loc$dtcTB, unlist(c(loc$tbDtcStat[iRow, 1:3], tf_name = tn)))
+  } 
+}
+loc$dtcTB <- data.frame(loc$dtcTB)
+
+if (species == 'mouse') {
+  # remove all upper case genes that have a only first upper case version 
+  ucSymb <- grep('^[A-Z][A-Z0-9]+', loc$dtcTB$tf_name, value = TRUE, perl = TRUE)
+  lcSymb <- sapply(ucSymb, function(x) return(str_to_title(x)))
+  rowToRm <- rep(FALSE, nrow(loc$dtcTB))
+  rowToRm[loc$dtcTB$tf_name %in% ucSymb[lcSymb %in% loc$dtcTB$tf_name]] <- TRUE
+  loc$dtcTB <- loc$dtcTB[!rowToRm, ]
+  loc$dtcTB$tf_name <- sapply(loc$dtcTB$tf_name, function(x) return(str_to_title(x)))
+} else {
+  # remove only first upper case genes that have all upper case version
+  lcSymb <- grep('^[A-Z][a-z0-9]+', loc$dtcTB$tf_name, value = TRUE, perl = TRUE)
+  ucSymb <- sapply(lcSymb, function(x) return(toupper((x))))
+  rowToRm <- rep(FALSE, nrow(loc$dtcTB))
+  rowToRm[loc$dtcTB$tf_name %in% lcSymb[ucSymb %in% loc$dtcTB$tf_name]] <- TRUE
+  loc$dtcTB <- loc$dtcTB[!rowToRm, ]
+  loc$dtcTB$tf_name <- sapply(loc$dtcTB$tf_name, function(x) return(toupper(x)))
+}
+
+# get gene id
+# identify TFs that are without expression 
+tfNoExp <- loc$dtcTB$tf_name[!(loc$dtcTB$tf_name %in% expCntFull[, expNameCol])]
+write.table(tfNoExp, paste0(outDataDir, '/tf-no-expr.csv'), row.names = FALSE, col.names = FALSE,
+            quote = FALSE)
+# retain only TFs with expression 
+loc$dtcTB <- loc$dtcTB[!(loc$dtcTB$tf_name %in% tfNoExp), ]
+loc$dtcTB <- cbind(loc$dtcTB, gene_id = expCntFull[match(loc$dtcTB$tf_name, expCntFull[, expNameCol]), expIdCol])
+write.csv(loc$dtcTB, paste0(outDataDir, '/motif-to-tf.csv'), row.names = F, quote = F)
+```
+
+It is assumed that TFs with a gene symbol consisting of a leading upper case letter followed by lower case letters and numbers are mouse version of the TFs; and the upper case is human version. If there are detection results for both versions, `r if (species == 'mouse') cat('human') else cat('mouse')` version is excluded. A total of `r length(which(rowToRm))` such results were detected and removed. In addition, there are `r length(tfNoExp)` TFs with no gene expression quantification in the given transcriptomic profile. Binding detection results associated with these TFs were excluded. These steps left results of `r length(unique(loc$dtcTB$motif_id))` motifs for analysis. There are a total of `r length(unique(loc$dtcTB$gene_id))` TFs associated with the retained motifs. The map between motif and TF can be found in *motif-to-tf.csv*.
+
+```{r tb-proc}
+if (file.exists(paste0(outDataDir, '/tf-bind-score.csv'))) {
+  # load binding score processed and saved previously
+  binScoreDf <- read.csv(paste0(outDataDir, '/tf-bind-score.csv'))
+  binScore <- as.matrix(binScoreDf[, 2:ncol(binScoreDf)])
+  rownames(binScore) <- binScoreDf$peak
+  rm(binScoreDf)
+} else {
+  binScore <- matrix(rep(-1, nrow(peakAcc) * length(unique(loc$dtcTB$motif_id))), nrow = nrow(peakAcc))
+  rownames(binScore) <- peakAcc$X
+  colnames(binScore) <- unique(loc$dtcTB$motif_id)
+  for (iMtf in 1:ncol(binScore)) {
+    mtf <- colnames(binScore)[iMtf]
+    if (iMtf > 1 && iMtf %% 20 == 1) {
+      put(sprintf('%d motifs have been processed.', iMtf - 1))
+    }
+    
+    outPre <- loc$dtcTB$output_prefix[loc$dtcTB$motif_id == mtf][1]
+    binRs <- read.table(sprintf('%s/%s/%s_overview.txt', inputParams$binDetectDir, outPre, outPre), 
+                        sep = '\t', header = TRUE)
+    maxScore <- apply(binRs[, paste0(names(peakAcc)[2:ncol(peakAcc)], '_score')], 1, function(x) return(max(x)))
+    peakId <- paste(binRs$peak_chr, binRs$peak_start, binRs$peak_end, sep = ':')
+    dups <- peakId[duplicated(peakId)]
+    if (length(dups) > 0) {
+      # there are peaks with multiple motif occurrence, use the largest score
+      toRm <- rep(FALSE, length(peakId))
+      for (dup in unique(dups)) {
+        dupIdx <- which(peakId == dup)
+        maxScore[dupIdx[1]] <- max(maxScore[dupIdx])
+        toRm[dupIdx[2:length(dupIdx)]] <- TRUE
+      }
+      maxScore <- maxScore[!toRm]
+      peakId <- peakId[!toRm]
+    }
+    binScore[peakId, mtf] <- maxScore
+  }
+  write.csv(data.frame(peak = rownames(binScore), binScore), paste0(outDataDir, '/tf-bind-score.csv'), 
+            row.names = FALSE, quote = FALSE)
+}
+
+```
+
+For each motif, the binding scores at each peak are aggregated across all samples and all occurrences (if multiple) by finding the max score. The aggregated binding score for each motif at each peak has been saved to *tf-bind_score.csv*, where -1 means no appearance of the motif at the corresponding peak.
+
+```{r call-bin, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+binScoreStatQntl <- 0.75
+
+plotScore <- function(df, title, binScoreHistQntl = 0.999, saveToFile = NULL,
+              meanVal = NULL, threshold = NULL) {
+  
+  histQntlVal <- quantile(df$score, binScoreHistQntl)
+  
+  df$score[df$score > histQntlVal] <- histQntlVal
+  p <- ggplot(df, aes(x = score)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) +
+  ggtitle(title) +
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), 
+        axis.title.y = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, vjust = -5)) +
+  labs(x = 'Binding score', y = 'Frequency')
+  
+  if (!is.null(meanVal)) {
+    p <- p + geom_vline(xintercept = meanVal, linetype = 'dashed', 
+                 color = 'red', size = 1.2)
+  }
+  
+  if (!is.null(threshold)) {
+    p <- p + geom_vline(xintercept = threshold, linetype = 'dashed', 
+                 color = 'green', size = 1.2)
+  }
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width = 6.5, height = 5)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+  
+  return(p)
+}
+
+# For saving the calculated score distribution
+distFlds <- c('mean', 'std', 'threshold', 'nOcurrance', 'nBindings')
+binScoreDist <- matrix(rep(NA, ncol(binScore) * length(distFlds)), nrow = ncol(binScore))
+rownames(binScoreDist) <- colnames(binScore)
+colnames(binScoreDist) <- distFlds
+# for saving called binding based on calculated threshold
+binCall <- matrix(rep(0, nrow(binScore) * ncol(binScore)), nrow = nrow(binScore))
+rownames(binCall) <- rownames(binScore)
+colnames(binCall) <- colnames(binScore)
+
+plotsDir <- paste0(figDir, '/bind-score-hists') # directory to save all figures
+if (!dir.exists(plotsDir)) dir.create(plotsDir)
+for (mtf in colnames(binScore)) {
+  df <- data.frame(score = binScore[binScore[, mtf] != -1, mtf])
+  statQntlVal <- quantile(df$score, binScoreStatQntl)
+  scores <- df$score[df$score < statQntlVal] 
+  # compute the statistics
+  binScoreDist[mtf, 'mean'] <- mean(scores)
+  binScoreDist[mtf, 'std'] <- sd(scores)
+  binScoreDist[mtf, 'threshold'] <- binScoreDist[mtf, 'mean'] + 1 * binScoreDist[mtf, 'std']
+  binScoreDist[mtf, 'nOcurrance'] <- length(which(binScore[, mtf] != -1))
+  # make binding call based on the calculated threshold
+  binCall[binScore[, mtf] > binScoreDist[mtf, 'threshold'], mtf] <- 1
+  binScoreDist[mtf, 'nBindings'] <- length(which(binCall[, mtf] == 1))
+  
+  p <- plotScore(df, loc$dtcTB$output_prefix[loc$dtcTB$motif_id == mtf][1], 
+            saveToFile = sprintf('%s/%s', plotsDir, mtf),
+            meanVal = binScoreDist[mtf, 'mean'], threshold = binScoreDist[mtf, 'threshold'])
+}
+
+# save binding score and call stat
+write.csv(data.frame(motif = rownames(binScoreDist), 
+                     name = loc$dtcTB$name[match(rownames(binScoreDist), loc$dtcTB$motif_id)],
+                     binScoreDist), 
+          paste0(outDataDir, '/tf-bind-stat.csv'),
+          row.names = FALSE, quote = F)
+
+# save tf binding call
+write.csv(data.frame(peak = rownames(binCall), binCall), paste0(outDataDir, '/tf-bind-call.csv'),
+          row.names = F, quote = F)
+```
+
+The TF binding was called individually for each motif. First, mean ($\mu$) and standard deviation $\sigma$ among binding scores within the `r binScoreStatQntl` quantile for the motif were calculated. A threshold $t$ was then computed by $\mu + \sigma$ and used to determine whether there was a TF binding, with score > $t$ deemed as binding and no otherwise. A histogram was made for each motif to show the distribution of binding scores, with the red vertical line representing the $\mu$ and the green vertical line indicating computed $t$, i.e., $\mu + \sigma$. Below is an example of such a plot. All histograms (named by motif ID) can be found in folder *bind-score-hists*. The calculated mean, standard deviation (std), threshold, the number of peaks with motif appearance, and the number of peaks with predicted TF binding have been saved to *tf-bind-stat.csv*. The TF binding calls for each motif at each peak can be found in *tf-bind-call.csv*
+
+
+```{r bin-score-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+mtf <- colnames(binScore)[1]
+plotScore(data.frame(score = binScore[binScore[, mtf] != -1, mtf]), 
+          loc$dtcTB$output_prefix[loc$dtcTB$motif_id == mtf][1], 
+          meanVal = binScoreDist[mtf, 'mean'], threshold = binScoreDist[mtf, 'threshold'])  
+```
+
+
+```{r tf-occ}
+# identify occurrence (binding) of specific TFs at peaks
+tfs <- unique(loc$dtcTB$gene_id)
+tfOcc <- matrix(rep(0, nrow(binCall) * length(tfs)), nrow = nrow(binCall))
+rownames(tfOcc) <- rownames(binCall)
+colnames(tfOcc) <- tfs
+for (tf in tfs) {
+  binOfTf <- binCall[, loc$dtcTB$motif_id[loc$dtcTB$gene_id == tf], drop = F]
+  if (ncol(binOfTf) == 0) {
+    put(sprintf('Binding data for TF: %s cannot be found', tf))
+  } else if (ncol(binOfTf) == 1) {
+    tfOcc[, tf] <- binOfTf[, 1]
+  } else {
+    tfOcc[, tf] <- apply(binOfTf, 1, function(x) if (sum(x) > 0) return(1) else return(0))
+  }
+}
+write.csv(data.frame(peak = rownames(tfOcc), tfOcc), paste0(outDataDir, '/tf-at-peak.csv'),
+          row.names = F, quote = F)
+```
+
+Based on the binding event detection for motifs, the binding of individual TFs at each peak was identified. The results were saved *tf-at-peak.csv*. The distribution of the number of distinct binding TFs at each peak among all peaks is provided in the histogram below (*nTF-at-peak-hist-1.pdf*)  
+
+```{r nTF-at-peak-hist, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+nTfPlotDf <- data.frame(nTf = apply(tfOcc, 1, function(x) return(sum(x))),
+                        peakLen = sapply(rownames(tfOcc), function(x) {
+                          flds <- strsplit(x, split = ':')[[1]]
+                          return(as.numeric(flds[3]) - as.numeric(flds[2]))
+                        }))
+p <- ggplot(nTfPlotDf, aes(x = nTf)) + 
+  geom_histogram(color="darkblue", fill = "lightblue", bins = 100) + 
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = '# of distinct binding TFs at individual peaks', y = 'Frequency')
+addGapToHist(p)
+```
+
+How the number of binding TFs varying along the length of peaks is indicated in the following scattered plot (*nTF-at-peak-scat-1.pdf*), where the Pearson correlation between the two is also provided. 
+
+```{r nTF-at-peak-scat, warning=FALSE, message=FALSE, results='hide', fig.height=4, fig.width=6.5, dev=c('png', 'pdf')}
+nTfPlotDf <- cbind(nTfPlotDf, log10PeakLen = log10(nTfPlotDf$peakLen))
+ggscatter(nTfPlotDf, x = "log10PeakLen", y = "nTf",
+          add = "reg.line",                                 # Add regression line
+          conf.int = TRUE,                                  # Add confidence interval
+          add.params = list(color = "blue", fill = "lightgray")) +
+  stat_cor(method = "pearson", label.x.npc =  0.01, label.y.npc = 0.9) +  # Add correlation coefficient
+  theme_classic()  +
+  theme(axis.text.x = element_text(size = 12), 
+        axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+  labs(x = 'Log10 of length of peaks', y = '# of distinct binding TFs at individual peaks')
+write.csv(cbind(peak = rownames(nTfPlotDf), nTfPlotDf), 
+          paste0(outDataDir, '/tf-at-peak-stat.csv'), row.names = F, quote = F)
+```
+
+The data used in the two plots above can be found in *tf-at-peak-stat.csv*. 

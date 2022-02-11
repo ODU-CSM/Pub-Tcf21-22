@@ -1,0 +1,48 @@
+
+
+```{r}
+suppressPackageStartupMessages(library(scater))
+
+# prep
+if (event == 'expression') {
+  inputData <- expInData
+  idCol <- expIdCol
+  startCoorCol <- expSCoorCol
+  endCoorCol <- expECoorCol
+  cnts <- expUse
+  annCols <- expAnnCols
+} else {
+  inputData <- accInData
+  idCol <- accIdCol
+  startCoorCol <- accSCoorCol
+  endCoorCol <- accECoorCol
+  cnts <- accUse
+  annCols <- accAnnCols
+}
+
+# load counts
+mode(cnts) <- 'integer'
+
+coor <- inputData[match(rownames(cnts), inputData[, idCol]), c(startCoorCol, endCoorCol)]
+tpm <- calculateTPM(cnts, coor[, 2] - coor[, 1])
+tpmOut <- cbind(inputData[match(rownames(tpm), inputData[, idCol]), c(idCol, annCols)], tpm)
+
+write.csv(tpmOut, sprintf('%s/%s.tpm.csv', outDataDir, event), row.names = FALSE, quote = FALSE)
+
+# install result and clean
+if (event == 'expression') {
+  expUse <- tpm
+} else {
+  accUse <- tpm
+}
+rm(inputData)
+rm(idCol)
+rm(startCoorCol)
+rm(endCoorCol)
+rm(annCols)
+rm(coor)
+rm(cnts)
+rm(tpmOut)
+```
+
+`r str_to_title(event)` level in TPM of `r if (event == 'expression') {sprintf('%ss', feature)} else {sprintf('%s promoters', feature)}` was calculated and saved to `r sprintf('*data/%s.tpm.csv*', event)`.

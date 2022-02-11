@@ -1,0 +1,53 @@
+
+
+#### `r expMod$moduleNames['{{modId}}']`
+
+```{r acc-coe-{{modId}}-setup}
+modId <- '{{modId}}'
+indEmDir <- sprintf('%s/%s', eModOutDir, expMod$moduleNames[modId])
+if (!dir.exists(indEmDir)) dir.create(indEmDir)
+indEmFigDir <- sprintf('%s/figures', indEmDir)
+if (!dir.exists(indEmFigDir)) dir.create(indEmFigDir)
+```
+
+All result files (including figures, which were saved to the figures subfolder) from the analysis within this section as discussed in below can be found in folder `r sprintf('*exp-mod/%s*', expMod$moduleNames[modId])`.
+
+```{r acc-coe-{{modId}}-data}
+modFeats <- expMod$featList[expMod$moduleLabels == expMod$moduleLabelOrdered[modId]]
+# assign the features to the sample group that the model is mostly correlated to
+maxCorGrp <- names(which.max(expMod$modGrpCor$cor[expMod$moduleNames[modId], ]))
+featByGrp <- list()
+featByGrp[[maxCorGrp]] <- modFeats
+```
+
+Below is a Heatmap (*zscore-heatmap.pdf*) that shows the promoter accessibility, expression level and promoter CpG density of included `r feature`s. The data of accessibility and expression were standardized such that each row has mean 0 and standard deviation 1 (zscore). 
+ 
+```{r acc-coe-{{modId}}-hmap, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+draw(combHeatmap(featByGrp, expGrp = expSGrps, 
+                 accGrp = accSGrps, featByClus = accClus,
+                 expData = expNorm, accData = accNorm, cpgDens = cpgDens,
+                 saveToFile = sprintf('%s/zscore-heatmap', indEmFigDir)))
+```
+
+The following are histograms of the correlation between expression and promoter accessibility of `r feature`s included. The correlation was computed using data of samples from all groups in the two datasets. From left to right, top to bottom, the figures include all promoters and those with low, medium and high CpG density, respectively. Each individual figure can be found under directory: *ea-cor-by-feat*.
+
+```{r acc-coe-{{modId}}-cor, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+# compute correlation between acc and exp for each gene and plot
+figSubDir <- paste0(indEmFigDir, '/ea-cor-by-feat')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+corOfModFeat<- eaCorByFeat[modFeats, 'cor']
+names(corOfModFeat) <- modFeats
+plotCorrByCD(corOfModFeat, promByCpGDens, saveToDir = figSubDir)
+```
+
+Below is the scatter plot of `r feature`s according to their expression level (log2(TPM)) and promoter accessibility (log2(TPM)) (*exp-and-acc.pdf*). The Pearson correlation between `r feature` expression level and promoter accessibility was computed for each sample group using data of all included `r feature`s. More specifically, the average expression/accessibility was first computed among the samples from a group for each included `r feature`/promoter, followed by calculating the correlation with each `r feature`/promoter being used as observation. 
+
+```{r acc-coe-{{modId}}-eaa, fig.height=7, fig.width=5, dev=c('png', 'pdf')}
+# correlation over sample specific feature
+p <- plotExpAndAcc(expUse[modFeats, ], extractData(accUse, modFeats),
+              expSGrps, frac = minTpm, 
+              saveToFile = paste0(indEmFigDir, '/ea-by-grp'))
+grid.draw(p)
+```
+

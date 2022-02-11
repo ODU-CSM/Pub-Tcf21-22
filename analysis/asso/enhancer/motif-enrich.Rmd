@@ -1,0 +1,74 @@
+
+## Motif enrichment
+
+```{r mot-enr, warning=FALSE}
+source(sprintf('%s/packages/utils/R/motif.R', Sys.getenv(c('R_LIB_J'))))
+
+motEnr<- read.table(sprintf('%s/%s/knownResults.txt', dstlPkMotDir, accSGrps[1]), 
+                      sep = '\t', header = TRUE, comment.char = '')
+motEnr$Motif.Name <- trimws(motEnr$Motif.Name)
+motGene <- extTfFromMot(motEnr$Motif.Name, motGeneMapFile = motGeneMapFile) 
+# Note, one motif may map to multiple genes, so the names of motGene may not be unique
+# multiple motif may map to same gene, so the content of motGene may not be unique as well
+
+# motGene <- toupper(sapply(motEnr$Motif.Name, 
+#                          function(x) return(strsplit(strsplit(x, split = '/')[[1]][2], 
+#                                                                           split = '-')[[1]][2])))
+# # there are NAs in motGene, for example no gene name appearing in the second part of CRE(bZIP)/Promoter/Homer
+# # for these motifs use the letters before the first ( as the gene name
+# iNa <- is.na(motGene)
+# motGene[iNa] <- toupper(substr(names(motGene)[iNa], 1, 
+#                                             regexpr('[(/]', names(motGene)[iNa], perl = TRUE) - 1))
+
+iMotGeneWithData <- motGene %in% toupper(anno$gene_symbol)
+# extract log p
+motEnrWithData <- matrix(rep(0, length(which(iMotGeneWithData)) * length(accSGrps)), ncol = length(accSGrps))
+colnames(motEnrWithData) <- accSGrps
+for (grp in accSGrps) {
+  homerRs <- read.table(sprintf('%s/%s/knownResults.txt', dstlPkMotDir, grp), 
+                      sep = '\t', header = TRUE, comment.char = '')
+  homerRs$Motif.Name <- trimws(homerRs$Motif.Name)
+  if (nrow(motEnr) != nrow(homerRs) 
+      || length(which(!(names(motGene) %in% homerRs$Motif.Name))) > 0
+      || length(which(!(homerRs$Motif.Name %in% names(motGene)))) > 0) {
+    stop('Inconsistent motif names among Homer report!\n')
+  }
+  # log p
+  motEnrWithData[, grp] <- homerRs$Log.P.value[match(names(motGene)[iMotGeneWithData], homerRs$Motif.Name)]
+}
+# -log p
+motEnrWithData <- cbind(data.frame('motif' = names(motGene)[iMotGeneWithData], 
+                                   'gene' = motGene[iMotGeneWithData]), 
+                        -motEnrWithData)
+write.table(motEnrWithData, file = paste0(outDataDir, '/motif-enrichment.-logP.txt'),
+          row.names = FALSE, quote = FALSE, sep = '\t', col.names = TRUE)
+
+# save extracted gene name and whether there is a match in expression data
+write.table(data.frame(motif = names(motGene), gene = motGene, match = iMotGeneWithData), 
+            paste0(outDataDir, '/mot-exp-match.txt'),
+            row.names = FALSE, quote = FALSE, sep = '\t', col.names = TRUE)
+
+# number of TFs in each figure plotted in next chunck
+nTfPerFig <- 24
+```
+
+There are enrichment estimate for total `r printNum(nrow(motEnr))` known motifs by running Homer. Gene (i.e., TF) names were extracted from the motif name returned by Homer. These gene names were then used to match the gene names in the gene expression data. The matching result was saved to *mot-exp-match.txt* that contains motif name, extracted TF name and a column indicating whether there is expression data available for the corresponding TF. Out of the total `r printNum(nrow(motEnr))` motifs, there are `r printNum(length(which(iMotGeneWithData)))` motifs, for which there are expression data available for their corresponding TFs. The enrichment of these motifs in distal peaks in each sample group were saved to *motif-enrichment.-logP.txt*. Below is a set of figures that plot the enrichment of motifs and the expression level of their corresponding TFs across all the sample groups. Each figure plots the data of `r nTfPerFig` motifs, except the last figure which may contain less number of motifs. These figures can be found under directory: *menr-gexp*, with names following pattern, *menr-gexp-[$i$]-1.pdf*, where $i$ is the $i$-th figure in the following sequence of figures. 
+
+```{r mot-enr-exp, results='asis'}
+enrFigDir <- paste0(figDir, '/menr-gexp')
+if (!dir.exists(enrFigDir)) dir.create(enrFigDir)
+knitr::opts_chunk$set(fig.path = paste0(enrFigDir, '/'))
+
+iTF <- 1
+while (iTF < nrow(motEnrWithData)) {
+  iTfToPlot <- iTF:(min(iTF + nTfPerFig - 1, nrow(motEnrWithData)))
+  p <- plotMEAndGE(motEnrWithData[iTfToPlot, c(names(motEnrWithData)[1:2], grpInCom)], expGrpAveCom)
+  subchunkify(p, chnkLbl = sprintf('menr-gexp-%d', (iTF + nTfPerFig - 1) / nTfPerFig), 
+            figHeight = 4 * (length(iTfToPlot) / 12), figWidth = 3 + 0.5 * length(grpInCom))
+  
+  iTF <- iTF + nTfPerFig
+}
+
+# restore fig dir
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+```

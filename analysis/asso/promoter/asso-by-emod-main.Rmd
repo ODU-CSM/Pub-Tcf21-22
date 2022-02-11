@@ -1,0 +1,25 @@
+### Co-expressed `r feature`s
+
+This subsection studies the promoter accessibility of `r feature`s identified in co-expression `r feature` module analysis. Analysis was not done for modules with a maximum correlation (with group specific expression pattern) less than `r sprintf("%.3f", minEModCor)`.
+
+```{r acc-coe}
+load(cExpModFile)
+expMod <- module
+rm(module)
+
+eModOutDir <- paste0(output, '/exp-mod')
+if (!dir.exists(eModOutDir)) dir.create(eModOutDir)
+
+# for each module, show heatmap and correlation histogram
+out <- NULL
+for (modId in names(expMod$moduleNames)) {
+  if (max(expMod$modGrpCor$cor[expMod$moduleNames[modId], ]) < minEModCor) {
+    # if the max correlation associated with this module is less than the given 
+    # threshold, no analysis
+    next
+  }
+  out <- c(out, knitr::knit_expand(file = file.path(knitr::opts_knit$get("output.dir"), "promoter", "asso-by-emod.Rmd")))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`

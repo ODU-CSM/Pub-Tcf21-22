@@ -1,0 +1,113 @@
+
+
+#### `r gsub('[feature]', feature, featSets$Title[{{iDa}}], fixed = TRUE)`
+
+```{r exp-da-{{iDa}}-setup}
+iDa <- {{iDa}}
+indDaDir <- sprintf('%s/%s', daOutDir, featSets$feat_set[iDa])
+if (!dir.exists(indDaDir)) dir.create(indDaDir)
+indDaFigDir <- sprintf('%s/figures', indDaDir)
+if (!dir.exists(indDaFigDir)) dir.create(indDaFigDir)
+```
+
+`r gsub('[feature]', feature, featSets$Desc[iDa], fixed = TRUE)` All result files from the analysis within this subsection as mentioned in below can be found in folder `r sprintf('*diff-acc/%s*', featSets$feat_set[iDa])`, including figures, which were saved to the *figures* subfolder.
+
+```{r exp-da-{{iDa}}-data}
+# pool features of interest
+# use a feature-group association table to facilitate the assigning features to groups
+featGrpAsso <- matrix(rep(0, nrow(accUse) * length(accSGrps)), nrow = nrow(accUse))
+rownames(featGrpAsso) <- rownames(accUse)
+colnames(featGrpAsso) <- accSGrps
+
+# pool features resulted from comparisons
+comps <- strsplit(featSets$Comparions[iDa], split = ';')[[1]]
+for (comp in comps) {
+  compRes <- read.csv(sprintf('%s/%s.csv', daResDir, comp))
+  # case and control groups in the comparison
+  case <- strsplit(accComps$Case[accComps$Comparison == comp], split = ';')[[1]]
+  ctrl <- strsplit(accComps$Control[accComps$Comparison == comp], split = ';')[[1]]
+  
+  # update featGrpAsso matrix by adding DA features from the comparison
+  featUp <- compRes[compRes$significant & compRes$direction == 'UP', 1] 
+  featDw <- compRes[compRes$significant & compRes$direction == 'DOWN', 1]
+  featGrpAsso[featUp, case] <- featGrpAsso[featUp, case] + 1
+  featGrpAsso[featDw, ctrl] <- featGrpAsso[featDw, ctrl] + 1
+}
+
+# retain only features that are tested significant
+featGrpAsso <- featGrpAsso[rowSums(featGrpAsso) > 0, ]
+# assign feature to group according to featGrpAsso
+featGrpAssn <- apply(featGrpAsso, 1, function(x) return(colnames(featGrpAsso)[which.max(x)]))
+featByGrp <- list()
+for (grp in accSGrps) { # maintain the original group appearing order
+  if (length(which(featGrpAssn == grp)) > 0) {
+    featByGrp[[grp]] <- names(featGrpAssn)[featGrpAssn == grp]
+  }
+}
+
+featGrpAssnOut <- cbind(feat = rownames(featGrpAsso), group = featGrpAssn)
+colnames(featGrpAssnOut)[1] <- names(expInData)[expIdCol]
+write.csv(featGrpAssnOut, paste0(indDaDir, '/group-assign.csv'),
+          row.names = FALSE, quote = FALSE)
+```
+
+Promoters identified in included comparisons were pooled together. In total, there are `r nrow(featGrpAsso)` identified promoters. These promoters were assigned to the sample group where their accessibility is the most prominent. This assignment was saved to *group-assign.csv*. The distribution of the promoters across the sample groups is provided in the following table.
+
+
+```{r exp-da-{{iDa}}-fdist}
+grps <- names(featByGrp)
+cnts <- rep(0, length(grps))
+for (i in 1:length(grps)) {
+  cnts[i] <- length(featByGrp[[i]])
+}
+featDist <- cbind(Group = grps, 'Number of promoters' = cnts)
+knitr::kable(featDist, row.names = FALSE,
+             align = 'lc',
+             caption = 'The distribution of promoters across sample groups')
+```
+
+Below is a Heatmap (*zscore-heatmap.pdf*) that shows the promoter accessibility, expression level and promoter CpG density of included `r feature`s. The data of accessibility and expression were standardized such that each row has mean 0 and standard deviation 1 (zscore). `r str_to_sentence(feature)`s are grouped according to their expression dynamics across samples, i.e., constantly low, constantly high and dynamic, as indicated by the left most color bar. 
+ 
+```{r exp-da-{{iDa}}-hmap, fig.height=5, fig.width=6.5, dev=c('png', 'pdf')}
+draw(combHeatmap(featByGrp, expGrp = strsplit(featSets$Groups_in_exp[iDa], split = ';')[[1]], 
+                 accGrp = strsplit(featSets$Groups_in_acc[iDa], split = ';')[[1]], featByClus = expClus,
+                 expData = expNorm, accData = accNorm, cpgDens = cpgDens, anaDataType = 'acc',
+                 saveToFile = sprintf('%s/zscore-heatmap', indDaFigDir)))
+```
+
+The following are histograms of the correlation between expression and promoter accessibility of `r feature`s included. The correlation was computed using data of samples from all groups in the two datasets. From left to right, top to bottom, the figures include all promoters and those with low, medium and high CpG density, respectively. Each individual figure can be found under directory: *ea-cor-by-feat*.
+
+```{r exp-da-{{iDa}}-cor, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+# compute correlation between acc and exp for each gene and plot
+figSubDir <- paste0(indDaFigDir, '/ea-cor-by-feat')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+
+featSel <- names(featGrpAssn)
+featSel <- featSel[featSel %in% rownames(eaCorByFeat)]
+corOfFeatSel<- eaCorByFeat[featSel, 'cor']
+names(corOfFeatSel) <- featSel
+plotCorrByCD(corOfFeatSel, promByCpGDens, saveToDir = figSubDir)
+```
+
+Below is a panel of scatter plots of `r feature`s according to their expression level (log2(TPM)) and promoter accessibility (log2(TPM)) (*ea-by-grp.pdf*). The Pearson correlation between `r feature` expression level and promoter accessibility was computed for each sample group using data of `r feature`s whose promoter were the most accessible in the samples from that group. More specifically, the average expression/accessibility was first computed among the samples from a group for each involved `r feature`/promoter, followed by calculating the correlation with each `r feature`/promoter being used as observation. If there are not enough `r feature`s (> 1) in a setting, the corresponding scatter plot is not drawn, resulting an empty slot in the panel below. 
+
+```{r exp-da-{{iDa}}-eaa1, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+# correlation over sample specific feature
+grpsInc <- unique(featGrpAssn)
+grpsInc <- grpsInc[grpsInc %in% grpInCom]
+grpsInc <- as.character(sort(factor(grpsInc, levels = accSGrps)))
+p <- plotExpAndAcc(extractData(expUse, featSel), accUse[featSel, ], 
+              grpsInc, fGrpAssn = featGrpAssn[featSel], frac = minTpm, 
+              saveToFile = paste0(indDaFigDir, '/ea-by-grp'))
+grid.draw(p)
+```
+
+The following (*exp-and-acc.pdf*) is a similar plot where all `r feature`s are included in every subplot, in other words not just the `r feature`s whose promoter were the most accessible in samples from the corresponding group.   
+
+
+```{r exp-da-{{iDa}}-eaa2, fig.height=4, fig.width=5, dev=c('png', 'pdf')}
+p <- plotExpAndAcc(extractData(expUse, featSel), accUse[featSel, ], 
+              grpsInc, frac = minTpm,
+              saveToFile = paste0(indDaFigDir, '/exp-and-acc'))
+grid.draw(p)
+```

@@ -1,0 +1,629 @@
+---
+output: pdf_document
+bibliography: literature.bib
+params:
+  title: "Differential anlayais of gene expression"
+  author: "Javon"
+  date: "January 5, 2021"
+  readCountFile: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/validation/rs-set1/results/data/data-used.csv'
+  idCol: 1
+  annCols: '2;3;4;5'
+  dataStartCol: 6
+  nameCol: 5        # column in the readCountFile providing the gene name
+  startCoorCol: 3   # column in the readCountFile providing the start coordinate of each gene
+  endCoorCol: 4     # column in the readCountFile providing the end coordinate of the each gene
+  # to proide expression/accessibility level in TMP for all genes, expected to be in exact format as readCountFile
+  tpmDataFile: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/validation/rs-set1/results/data/tpm.csv'
+  feature: 'gene' # typically, 'gene' or 'transcript'
+  event: 'expression' # typically, 'accessibility' or 'expression'
+  # it is assumed the first three columns (, which are the only columns that will be used) in sampGrpSpecFile are:
+  # Sample, Batch, Group in the sequence. 
+  sampGrpSpecFile: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/data/samp-grp.csv'
+  # csv file specifying comparions to be done
+  compFile: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/de-gene/comparisons.csv' 
+  output: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/de-gene/results'
+  logFile: 'F:/projects/tissue-regen/analysis/mouse-cardiac-fibro/rna-javon/de-gene/run-log/diff-evnt.log'
+  
+  fdr: 0.05 # FDR used in identifying significant gene
+  minLfc: 0.585 # minimum of log2 fold change (LFC) used in identifying significant gene
+  indFilter: FALSE # whether applying indenpendent filter during testing
+  cookscutoff: TRUE # theshold on Cook's distance, 0.99 by default, check DESeq2::results for more detailes
+title: "`r params$title`"
+author: "`r params$author`"
+date: "`r params$date`"
+---
+
+## Note
+Differential analysis will be carried out for all `r params$feature`s included in the "*readCountFile*", which means no filtering  will be done. This script is expected to be run after the validation script, in which a read count dataset has been thoroughly inspected and unneeded `r params$feature`s have been filtered. All figures can be found in the figures folder under the given output directory. 
+
+```{r set-up, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+# Bioconductor
+# library(BiocManager) # 
+library(DESeq2)
+library(scater) # 
+library(EnhancedVolcano) 
+
+# CRAN
+library(ggrepel) # 
+library(ggplot2)
+library(ashr) # 
+library(MASS)
+library(plyr) # 
+library(gdata) #
+library(dplyr)
+library(RColorBrewer)
+library(pheatmap) #
+library(PoiClaClu) # 
+library(gridExtra) # 
+library(grid)
+library(corrplot)
+library(logr)
+library(english)
+library(Rtsne)
+library(stringr)
+
+options(stringsAsFactors = FALSE)
+
+readCountFile <- params$readCountFile
+tpmDataFile <- params$tpmDataFile
+feature <- params$feature
+event <- params$event
+idCol <- params$idCol 
+annCols <- params$annCols
+if (!is.null(annCols) && !is.integer(annCols)) {
+  annCols <- as.integer(strsplit(annCols, ';')[[1]])
+}
+dataStartCol <- params$dataStartCol
+nameCol <- params$nameCol
+startCoorCol <- params$startCoorCol
+endCoorCol <- params$endCoorCol
+sampGrpSpecFile <- params$sampGrpSpecFile
+compFile <- params$compFile
+output <- params$output
+logFile <- params$logFile
+fdr <- params$fdr
+minLfc <- params$minLfc
+indFilter <- params$indFilter
+cookscutoff <- params$cookscutoff
+
+# set up output folders
+outDataDir <- paste0(output, '/data')
+if (!dir.exists(outDataDir)) dir.create(outDataDir)
+figDir <- paste0(output, '/figures')
+if (!dir.exists(figDir)) dir.create(figDir)
+testDir <- paste0(output, '/de-tests')
+if (!dir.exists(testDir)) dir.create(testDir)
+
+# set up log
+if (is.null(logFile)) {
+  logFile <- file.path(tempdir(), "diff-evnt.log")
+}
+logger <- log_open(logFile, logdir = FALSE)
+options("logr.notes" = FALSE)
+
+# log passed in running parameters
+put("Input parameters: ", console = FALSE)
+put(paste("readCountFile=", params$readCountFile), console = FALSE)
+
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+knitr::opts_chunk$set(dev.args = list(png = list(type = "cairo")))
+```
+
+```{r load-data}
+inputData <- read.csv(readCountFile, stringsAsFactors = FALSE)
+
+# process sample grouping
+sampGrpSpec <- read.csv(sampGrpSpecFile, header = TRUE, stringsAsFactors = FALSE)
+sampGrpCol <- 3
+sampGrps <- unique(sampGrpSpec[, sampGrpCol])
+sampOfGrp <- list()
+sampUse <- NULL # only use samples in the sample group specification file
+for (i in 1:length(sampGrps)) {
+  sampOfGrp[[i]] <- sampGrpSpec[sampGrpSpec[, sampGrpCol] == sampGrps[i], 1]
+  if (length(which(!(sampOfGrp[[i]] %in% names(inputData)))) > 0) {
+    stop(sprintf('Sample(s): %s in sampGrpSpecFile cannot be found in readCountFile', 
+                 paste0(sampOfGrp[[i]][which(!(sampOfGrp[[i]] %in% names(inputData)[dataStartCol:ncol(inputData)]))], 
+                      collapse = ';')))
+  }
+  sampUse <- c(sampUse, sampOfGrp[[i]])
+}
+names(sampOfGrp) <- sampGrps
+
+# load comparisons
+comps <- read.csv(compFile, stringsAsFactors = FALSE)
+```
+
+```{r functions}
+printNum <- function(number) {
+  if (number < 10) {
+    return(english(number))
+  } else {
+    return(prettyNum(number, big.mark = ','))
+  }
+}
+
+printNames <- function(nms) {
+  if (length(nms) == 1) {
+    return(nms)
+  }
+  str <- paste(nms[1:(length(nms) - 1)], collapse = ', ')
+  str <- sprintf('%s and %s', str, nms[length(nms)])
+  return(str)
+}
+
+zscore <- function(matrix){
+  return( t(scale(t(matrix))))
+}
+
+plotPv <- function(pvs, title, saveToFile = NULL) {
+  df <- data.frame(pv = pvs)
+  p <- ggplot(df, aes(x = pv)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) +
+    theme_classic() +
+    theme(axis.text.x = element_text(size = 12), 
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = 'P-Value', y = 'Frequency')
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste0(saveToFile, ".pdf"), width = 8, height = 6)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp=gpar(fill=NA))
+    dev.off()
+  }
+  
+  p <- p + ggtitle(title) +
+    theme(plot.title = element_text(margin = margin(t = 10, b = -20), hjust = 0.5)) 
+  
+  return(p)
+}
+
+# find the boundary of the larget interval within a sequence of numbers
+# it is assumed numbers is sorted increasingly
+findBnrdOfLrgIntv <- function(nums, boundary = 'left') {
+  if (length(nums) == 1) {
+    return(nums)
+  } else if (length(nums) == 2) {
+    leftBnrd <- nums[1]
+    rightBnrd <- nums[2]
+  } else {
+    lrgIntv <- nums[2] - nums[1]
+    leftBnrd <- nums[1]
+    rightBnrd <- nums[2]
+    for (i in 3:length(nums)) {
+      if (nums[i] - nums[i - 1] >= lrgIntv) {
+        lrgIntv <- nums[i] - nums[i - 1]
+        leftBnrd <- nums[i - 1]
+        rightBnrd <- nums[i]
+      }
+    }
+  }
+  
+  if (boundary == 'left') {
+    return(leftBnrd)
+  } else {
+    return(rightBnrd)
+  }
+}
+
+
+# plot LFC against base mean
+plotLfcMean <- function (baseMean, lfc, signiciant, title, saveToFile = NULL, 
+                         lfcLimit = NULL, tolerance = 6) {
+  df <- data.frame(baseMean = log10(baseMean), lfc = lfc, signiciant = signiciant)
+  
+  # set limit of LFC
+  if (is.null(lfcLimit)) {
+    # automatically determine lfcLimit
+    # use lfc following right before/after the largest interval of top "tolerance" lfc
+    lfcSrt <- sort(df$lfc)
+    leftLimit <- findBnrdOfLrgIntv(lfcSrt[1:tolerance], boundary = 'right')
+    rightLimit <- findBnrdOfLrgIntv(lfcSrt[(length(lfcSrt) - tolerance + 1):length(lfcSrt)], 
+                                    boundary = 'left')
+    xlim <- max(abs(leftLimit), abs(rightLimit)) + 1
+  }
+  df$lfc[df$lfc > xlim] <- xlim
+  df$lfc[df$lfc < -xlim] <- -xlim
+  
+  p <- ggplot(df, aes(x = baseMean, y = lfc, color = signiciant)) +
+    geom_point(size = 0.8, pch = 20) +
+    theme_classic() +
+    theme(axis.text.x = element_text(size = 12), legend.position = 'none', 
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    scale_color_manual(values = c('grey80', 'grey40')) +
+    labs(x = 'Log10 mean of normalized counts of all samples', y = 'Log2 fold change')
+  
+  if (!is.null(saveToFile)) {
+    pdf(paste0(saveToFile, ".pdf"), width = 8, height = 6)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp=gpar(fill=NA))
+    dev.off()
+  }
+  
+  p <- p + ggtitle(title) +
+    theme(plot.title = element_text(margin = margin(t = 10, b = -20), hjust = 0.5))
+  
+  return(p)
+}
+
+# Volcano plot of LFC and PValue
+plotLfcPv <- function(pvalue, lfc, label, title, fdr = 0.05, minLfc = 0.585, 
+                      xlim = NULL, ylim = NULL, saveToFile = NULL, tolerance = 6,
+                      nLabels = 20) {
+  df <- data.frame(pv = pvalue, lfc = lfc, label = label)
+  df <- df[!is.na(df$pv), ]  # remove NA
+  df$pv[df$pv == 0] <- min(df$pv[df$pv != 0]) # remove 0
+  
+  # set lim on x, y
+  if (is.null(xlim)) {
+    # automatically determine xlim
+    # use lfc following right before/after the largest interval of top "tolerance" lfc
+    lfcSrt <- sort(df$lfc)
+    leftLimit <- findBnrdOfLrgIntv(lfcSrt[1:tolerance], boundary = 'right')
+    rightLimit <- findBnrdOfLrgIntv(lfcSrt[(length(lfcSrt) - tolerance + 1):length(lfcSrt)], 
+                                    boundary = 'left')
+    xlim <- max(abs(leftLimit), abs(rightLimit)) + 1
+  }
+  
+  if (is.null(ylim)) {
+    # automatically determine ylim
+    # use -log10 pvalue right below the largest interval of log10 of top "tollerance" pvalue
+    ylim <- findBnrdOfLrgIntv(sort(-log10(df$pv))[(nrow(df) - tolerance + 1):nrow(df)], 
+                              boundary = 'left') + 1
+    
+  }
+  
+  df$pv[df$pv < 10^(-ylim)] <- 10^(-ylim) 
+  df$lfc[df$lfc > xlim] <- xlim
+  df$lfc[df$lfc < -xlim] <- -xlim
+  
+  # show num_pos num_neg
+  nUp <- length(which(df$pv < fdr & df$lfc > minLfc))
+  nDown <- length(which(df$pv < fdr & df$lfc < -minLfc))
+  
+  pLabelCut <- df$pv[order(df$pv)][20]
+  p <- EnhancedVolcano(df, lab = df$label, x = 'lfc', y = 'pv',
+                       selectLab = df$label[order(df$pv)][1:nLabels], # mark top genes
+                       #selectLab = c("FOS", "LDHA"), # mark selected genes
+                       title = NULL,
+                       subtitle = NULL,
+                       xlab = bquote(~Log[2]~ "Fold Change"),
+                       ylab = bquote(~-Log[10]~ "Adjusted P-Value"),
+                       #xlim = c(-6, 6),
+                       pCutoff = fdr,
+                       FCcutoff = minLfc,
+                       #pLabellingCutoff = labelcut,
+                       cutoffLineType = 'twodash',
+                       cutoffLineWidth = 0.8,
+                       # pointSize = 1.0, # todo: fix incomparibility in R3.5 and R4
+                       # labSize = 2.0,
+                       # DrawConnectors = F,
+                       # legend = c("NS","Log2 FC","P","P & Log2 FC"),
+                       legendLabels = c('NS', 'LFC', 'PV', 'PV&LFC'),
+                       caption = NULL,
+                       legendPosition = 'right',
+                       legendLabSize = 10,
+                       axisLabSize = 12,
+                       legendIconSize = 3.0) +
+    theme(axis.text.x = element_text(size = 12),  
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) 
+  
+  # save PDF
+  if (!is.null(saveToFile)) {
+    pdf(paste(saveToFile, "pdf", sep="."), width=8, height=6)
+    grid.arrange(p, ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+    
+  p <- p + ggtitle(title) + 
+      theme(plot.title = element_text(margin = margin(t = 10, b = -20), hjust = 0.5)) 
+  
+  return(p)
+}
+
+# Return a list of two plots, the first one without column cluster and the second with
+plotEvnt <- function(df, nClass = 2, saveToDir = NULL){
+  annRow <- NA
+  if (nrow(df) > nClass){
+    # the number of rows in the data is more than the number of needed classes, 
+    # obtain row clusters
+    p <- pheatmap(df, cluster_cols = FALSE, border_color = NA, cutree_rows = nClass, 
+                  show_rownames = FALSE, silent = TRUE)
+    rowClus <- sort(cutree(p$tree_row, k = nClass))
+    
+    clusOut <- data.frame(ID = rownames(df), cluster = rowClus[match(rownames(df), names(rowClus))], df)  
+    clusOut <- clusOut[sort(clusOut$cluster, index.return = TRUE)$ix, ]
+    if (!is.null(saveToDir)) {
+      write.csv(clusOut, paste0(saveToDir, '/hp-row-clus.csv'), row.names = FALSE, quote = FALSE)
+    } 
+    
+    annRow <- data.frame(class = as.character(rowClus))
+    rownames(annRow) <- names(rowClus)
+  }
+  
+  cellHeight <- NA
+  if (nrow(df) < 20) {
+    cellHeight <- 20
+  }
+  
+  p <- list()
+  # no clustering column
+  p[[1]] <- pheatmap(df, border_color = NA, cluster_cols = FALSE, cutree_rows = nClass,
+       show_rownames = FALSE, annotation_row = annRow, cellheight = cellHeight,
+       annotation_names_row = FALSE, annotation_legend = FALSE, silent = TRUE)
+  # with clustering column
+  p[[2]] <- pheatmap(df, border_color = NA, cluster_cols = TRUE, cutree_rows = nClass,
+       show_rownames = FALSE, annotation_row = annRow, cellheight = cellHeight,
+       annotation_names_row = FALSE, annotation_legend = FALSE, silent = TRUE)
+  
+  if (!is.null(saveToDir)) {
+    # no clustering column
+    pdf(paste0(saveToDir, "/hp-no-col-clus.pdf"), width = 6.4, height = 6)
+    grid.arrange(p[[1]][[4]], ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+    # with clustering column
+    pdf(paste0(saveToDir, "/hp-with-col-clus.pdf"), width = 6.4, height = 6)
+    grid.arrange(p[[2]][[4]], ncol = 1)
+    grid.rect(gp = gpar(fill = NA))
+    dev.off()
+  }
+  
+  
+  # if (!is.null(saveToDir)) {
+  #   # no clustering column
+  #   p <- pheatmap(df, border_color = NA, cluster_cols = FALSE, cutree_rows = nClass,
+  #      show_rownames = FALSE, annotation_row = annRow, cellheight = cellHeight,
+  #      annotation_names_row = FALSE, annotation_legend = FALSE, silent = TRUE,
+  #      filename = paste0(saveToDir, "/hp-no-col-clus.pdf"))
+  #   # with clustering column
+  #   p <- pheatmap(df, border_color = NA, cluster_cols = TRUE, cutree_rows = nClass,
+  #      show_rownames = FALSE, annotation_row = annRow, cellheight = cellHeight,
+  #      annotation_names_row = FALSE, annotation_legend = FALSE, silent = TRUE,
+  #      filename = paste0(saveToDir, "/hp-with-col-clus.pdf"))
+  # }
+  
+  
+  
+  return(p)
+}
+
+plotDE <- function(de, nameCol, evntCols, figDir, main = ''){
+    grobs <- list()
+      
+    ##  Plots
+    grobs[[1]] <- plotPv(de$pvalue[!is.na(de$pvalue)], 'Raw P-Values', paste0(figDir, '/hist-pv'))  
+    grobs[[2]] <- plotPv(de$pvalue[!is.na(de$padj)], 'Ajusted P-Values', paste0(figDir, '/hist-padj'))
+    
+    grobs[[3]] <- plotLfcMean(de$baseMean, de$lfcRaw, de$significant, 'Raw LFC', paste0(figDir, '/point-lfc-mean'))
+    grobs[[4]] <- plotLfcMean(de$baseMean, de$lfcShrunken, de$significant, 'Shrunken LFC', paste0(figDir, '/point-slfc-mean'))
+
+    grobs[[5]] <- plotLfcPv(de$padj, de$lfcRaw, de[, nameCol], 'Raw LFC', fdr = fdr,
+              minLfc = minLfc, saveToFile = paste0(figDir, '/volcano-pv-lfc'))
+    grobs[[6]] <- plotLfcPv(de$padj, de$lfcShrunken, de[, nameCol], 'Shrunken LFC', fdr = fdr,
+              minLfc = minLfc, saveToFile = paste0(figDir, '/volcano-pv-slfc'))
+
+    if (length(which(de$significant)) > 0) {
+      # plot feature event
+      zscoreDf <- zscore(de[de$significant, evntCols])
+      rownames(zscoreDf) <- de[de$significant, 1]
+      plots <- plotEvnt(zscoreDf, saveToDir = figDir)
+      # plots <- plotEvnt(zscoreDf)
+      grobs[[7]] <- plots[[1]][[4]]
+      grobs[[8]] <- plots[[2]][[4]]
+      heights <- unit(c(2, 2, 3, 4), rep('in', 4))
+    } else {
+      heights <- unit(c(2, 2, 3), rep('in', 3))
+    }
+    
+    # return(grobs)
+    grid.arrange(grobs = grobs, ncol = 2, heights = heights,
+                 top = textGrob(main,just = c('center'),
+                              gp = gpar(fontsize = 22)))
+}
+```
+
+## Data Info
+
+There are `r event` data of total `r sprintf('%s %s', printNum(nrow(inputData)), feature)`s for `r printNum(ncol(inputData) - dataStartCol + 1)` samples in the input data file (i.e., "*readCountFile*"). The samples are: `r printNames(names(inputData)[dataStartCol:ncol(inputData)])`. There are `r printNum(length(sampUse))` samples found in the given "*sampGrpSpecFile*". Only these samples (, which may be a subset of those in the `r event` data file) will be included in the subsequent analysis and are: `r printNames(sampUse)`. 
+
+## Differential analysis
+```{r DESeq2-data, message=FALSE}
+dataUse <- inputData[, c(idCol, dataStartCol:ncol(inputData))] # extract data for analysis
+# retain only samples included in the sample grouping file for analysis
+dataUse <- dataUse[, c(1, match(sampUse, names(dataUse)))] 
+
+cnts <- as.matrix(dataUse[, 2:ncol(dataUse)])
+rownames(cnts) <- dataUse[, 1]
+mode(cnts) <- 'integer'
+
+sampInfo <- sampGrpSpec[match(colnames(cnts), sampGrpSpec[, 1]), ]
+batch <- factor(sampInfo[, 2])
+group <- factor(sampInfo[, sampGrpCol])
+coldata <- data.frame(row.names = colnames(cnts), 
+                      samp = colnames(cnts),
+                      batch = batch,
+                      group = group)
+
+if (length(levels(batch)) > 1){
+  desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group + batch)
+  
+} else {
+  desData <- DESeqDataSetFromMatrix(countData = cnts, 
+                                colData = coldata, 
+                                design = ~  0 + group)
+}
+
+desObj <- DESeq(desData)
+normCnts <- counts(desObj, normalized = TRUE)
+normCntsOut <- cbind(inputData[match(rownames(normCnts), inputData[, idCol]), c(idCol, annCols)], normCnts)
+write.csv(normCntsOut, paste0(outDataDir, '/normalized-counts.csv'), 
+          row.names = FALSE, quote = FALSE)
+
+if (is.null(tpmDataFile)) {
+  # compute TPM
+  coor <- inputData[match(dataUse[, 1], inputData[, idCol]), c(startCoorCol, endCoorCol)]
+  tpm <- calculateTPM(cnts, coor[, 2] - coor[, 1])
+  tpmOut <- cbind(inputData[match(dataUse[, 1], inputData[, idCol]), c(idCol, annCols)], tpm)
+  write.csv(tpmOut, paste0(outDataDir, '/tpm.csv'), row.names = FALSE, quote = FALSE)
+} else {
+  # load TMP
+  tpm <- read.csv(tpmDataFile)
+  tpm <- tpm[match(dataUse[, 1], tpm[, idCol]), match(names(dataUse)[2:ncol(dataUse)], names(tpm))]
+  tpm <- as.matrix(tpm)
+  rownames(tpm) <- dataUse[, 1]
+}
+```
+
+The normalized read counts by DESeq2 were saved to *data/normalized-counts.csv*. `r if(is.null(tpmDataFile)) {sprintf('%s level (in TPM) of %ss was calculated and saved to *data/tpm.csv*.', str_to_title(event), feature)}` The histograms of read counts before and after normalization are in below (*cnt-hist-1.pdf*). 
+
+```{r cnt-hist, fig.height=4, fig.width=10, dev=c('png', 'pdf')}
+plotLogOfCnt <- function(cnts, title) {
+  df <- data.frame(cnt = log10(c(cnts + 1)))
+  p <- ggplot(df, aes(x = cnt)) + 
+    geom_histogram(color="darkblue", fill = "lightblue", bins = 100) +
+    theme_classic() + ggtitle(title) +
+    theme(axis.text.x = element_text(size = 12), 
+          plot.title = element_text(margin = margin(t = 10, b = -20, l = 50, r = 50),
+                                    hjust = 0.5),
+          axis.title.x = element_text(size = 12), axis.title.y = element_text(size = 12)) +
+    labs(x = expression(Log[10]~'(count + 1)'), y = 'Frequency') +
+    scale_x_continuous(breaks = c(0, 1, 2, 3, 4, 5)) 
+  return(p)
+}
+
+grobs <- list()
+grobs[[1]] <- plotLogOfCnt(counts(desObj), 'Raw counts')
+grobs[[2]] <- plotLogOfCnt(counts(desObj, normalized = TRUE), 'Normalized counts') +
+   theme(axis.title.y = element_blank())
+grid.arrange(arrangeGrob(grobs = grobs, ncol = 2))
+```
+
+The following is the CV (coefficient of variation) plot of per-`r feature` normalized read count, i.e., CV plotted against the mean count of each `r feature` over all samples (*cnt-cv-1.pdf*). 
+
+```{r cnt-cv, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotDispEsts(desObj, CV = TRUE,
+             xlab = 'Mean of normalized counts',
+             ylab = 'Coefficient of variation')
+```
+
+Tests for differential `r event` were done with DESeq2. For every comparison in the given "*compFile*", a set of outputs was resulted from the analysis, consisting of:
+
+1. *de-tests/[compName].csv*, a csv file that contains the test results for all `r feature`s, including: 
+    + Annotation of `r feature`s found in the input *readCountFile*.
+    + Mean of normalized count across all samples (in column *baseMean*).
+    + Both raw and shrunken log2 of fold change (LFC) (in columns *lfcRAW* and *lfcShrunken*, respectively) and their corresponding standard deviations (in columns *lfcSERaw* and *lfcSEShrunken*). The shrunken LFC was obtained using the adaptive shrinkage estimator introduced in [@Stephens2016].
+    + P-value (column *pvalue*) and that adjusted for multiple testing (column *padj*). Note that not all `r feature`s have a p-value reported in the file. Missing p-value can be due to either (1) low read counts or (2) large Cook's distance (adjusted by the input parameter "*cookscutoff*").
+    + Indicator of differential `r event` significance (column *significance*). The differential `r event` of a `r feature` is considered to be significant when the absolute value of estimated shrunken LFC is over `r minLfc` (passed in by input parameter "*minLfc*") and adjusted p-value is less than `r fdr` (passed in by input parameter "*fdr*"). TRUE in column *significance* indicates significant differential `r event`, with FALSE meaning the opposite. 
+    + A *direction* column, indicating the direction of the change, with UP meaning the `r feature` was up regulated in the case-group comparing to the control-group in the comparison, and DOWN meaning the opposite. 
+    + `r str_to_title(event)` level of `r feature`s in TPM in all samples. 
+Results (rows) in the file were arranged according to *significance*, adjusted p-value (*padj*) and LFC (*lfcShrunken*) in sequence.   
+
+2. *figures/[compName]/hist-pv.pdf* and *figures/[compName]/hist-padj.pdf*, respectively, the histograms of p-values and adjusted p-values.
+
+3. *figures/[compName]/point-lfc-mean.pdf* and *figures/[compName]/point-slfc-mean.pdf*, scatter plots of LFC against log10 mean of normalized counts of all samples. The former plots the raw LFC and the latter plots the shrunken LFC.
+
+4. *figures/[compName]/volcano-pv-lfc.pdf* and *figures/[compName]/volcano-pv-slfc.pdf*, volcano plots of p-value against raw LFC (the former) and shrunken LFC (the latter).
+5. *figures/[compName]/hp-no-col-clus.pdf* and *figures/[compName]/hp-with-col-clus.pdf*, heatmap plots of standard normalized (zscore) TPM `r event` data of `r feature`s that were tested significant for differential `r event`. If no `r feature` was significant, these two plots would not be created. The two plots are identical except that the later has column clusters showing. 
+6. *figures/[compName]/hp-row-clus.csv*, the `r feature` cluster assignment in the two figures in 5 together with TPM `r event` data in all samples.  
+
+All figures listed above from each comparison were combined and presented in below. The combined figures were saved in two different formats, pdf: *figures/de-ana-$i$.pdf* and png: *figures/de-ana-$i$.png*, where $i$ is the order of the comparison appearing in the input *compFile*. 
+
+
+```{r de-ana, message=FALSE, results='asis', fig.height=12, fig.width=10, dev=c('png', 'pdf')}
+rsNames <- gsub("group", "", resultsNames(desObj))
+
+stats <- c('ttlReport', 'Up', 'Down', 'ttlSig', 'UpSig', 'DownSig')
+testSmmry <- matrix(rep(NA, nrow(comps) * length(stats)), nrow = nrow(comps))
+colnames(testSmmry) <- stats
+rownames(testSmmry) <- comps[, 1]
+
+for (i in 1:nrow(comps)){
+  # cat(sprintf('\n### Comparison: %s\n\n\n', comps[i, 1]))
+  
+  case <- match(comps[i, 2], rsNames)
+  if (any(is.na(case))) {
+    put(sprintf('Tests not done for comparison: %s, due to not all case-groups (%s) found in data (i.e., sampGrpSpecFile)', 
+                comps[i, 1], comps[i, 2]), console = FALSE)
+    next
+  }
+  ctrl <- match(strsplit(comps[i, 3], split = ';')[[1]], rsNames)
+  if (any(is.na(ctrl))) {
+    put(sprintf('Tests not done for comparison: %s, due to not all control-groups (%s) found in data (i.e., sampGrpSpecFile)', 
+                comps[i, 1], comps[i, 3]), console = FALSE)
+    next
+  }
+  
+  contrast <- rep(0, length(rsNames))
+  contrast[case] <- 1/length(case)
+  contrast[ctrl] <- -1/length(ctrl)
+  
+  # retrieve the test results
+  de <- results(desObj, contrast = contrast, independentFilter = indFilter, 
+            cooksCutoff = cookscutoff)
+  deLS <- lfcShrink(desObj, contrast = contrast, type = 'ashr')
+  
+  # merge the results
+  de <- as.data.frame(de)
+  names(de)[2:3] <- c('lfcRaw', 'lfcSERaw')
+  deLS <- as.data.frame(deLS)
+  names(deLS)[2:3] <- c('lfcShrunken', 'lfcSEShrunken')
+  de <- cbind(deLS[, 1:3], de[match(rownames(deLS), rownames(de)), 2:3], deLS[, 4:5])
+  
+  # identify significant genes based on adjusted pvalue and estimated shrunken LFC
+  sig <- de$padj < fdr & abs(de$lfcShrunken) > minLfc
+  sig[is.na(sig)] <- FALSE
+  # find change direction
+  drc <- rep('UP', nrow(de))
+  drc[de$lfcShrunken < 0] <- 'DOWN'
+  de <- cbind(de, direction = drc, significant = sig)
+  
+  de <- cbind(inputData[match(rownames(de), inputData[, idCol]), c(idCol, annCols)], 
+                 de, tpm[match(rownames(de), rownames(tpm)), ])
+  # annColsInDE <- 1 + 1:length(annCols)
+  nameColInDE <- match(names(inputData)[nameCol], names(de))
+  evntColsInDE <- (ncol(de) - ncol(tpm) + 1):ncol(de)
+  
+  # sort rows according to significance
+  de <- de[sort(abs(de$lfcShrunken), decreasing = TRUE, index.return = TRUE)$ix, ]
+  de <- de[sort(de$padj, index.return = TRUE, na.last = TRUE)$ix, ]
+  de <- de[sort(de$significant, decreasing = TRUE, index.return = TRUE)$ix, ]
+  write.csv(de, sprintf('%s/%s.csv', testDir, comps[i, 1]), 
+            row.names = FALSE, quote = FALSE)
+  
+  # summarize the test results
+  testSmmry[i, 'ttlReport'] <- length(which(!is.na(de$padj)))
+  testSmmry[i, 'Up'] <-length(which(!is.na(de$padj) & de$lfcShrunken > 0))
+  testSmmry[i, 'Down'] <-length(which(!is.na(de$padj) & de$lfcShrunken < 0))
+  testSmmry[i, 'ttlSig'] <- length(which(de$significant))
+  testSmmry[i, 'UpSig'] <- length(which(de$significant & de$lfcShrunken > 0))
+  testSmmry[i, 'DownSig'] <- length(which(de$significant & de$lfcShrunken < 0)) 
+  
+  # plotting
+  sampFigDir <- sprintf('%s/%s', figDir, comps[i, 1])
+  if (!dir.exists(sampFigDir)) dir.create(sampFigDir)
+  plotDE(de, nameColInDE, evntColsInDE, sampFigDir, 
+         main = sprintf('Comparison: %s\n', comps[i, 1]))
+} 
+```
+
+The DE testing results are summarized in the table below. In this table, *ttlReport* represents the total number of `r feature`s that has a reported p-value; *Up* (and *Down*) indicates out of the total (i.e., *ttlReport*), the number of `r feature`s that are up (and down) regulated; *ttlSig* provides the total `r feature`s that were tested significant for differential `r event`; and *UpSig* (and *DownSig*) gives the number of up (and down) regulated `r feature`s that were tested significant. Note that in this table, *Up* and *Down* may not add up to the *ttlReport*, due to the existence of genes with an estimated shrunken LFC equal to zero. If a comparison receives NA on all columns in the table, it means DE testing was not done for that comparison (check the log file for the cause). 
+
+```{r test-smmry}
+knitr::kable(testSmmry, row.names = TRUE, 
+      align = 'cccccc',
+      caption = "Summary of results from DE testing")
+```
+
+
+
+
+## References
+
+```{r 'end-doc'}
+log_close()
+```
+

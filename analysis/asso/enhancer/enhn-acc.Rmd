@@ -1,0 +1,164 @@
+
+# Distal peaks and `r feature` expression
+
+Note, results from the analysis in this section were saved to folder: *distal-peak*
+
+```{r dstl-peak-setup}
+# save outDataDir, figDir for restoring at the end of this section
+outDataDirBk <- outDataDir
+figDirBK <- figDir
+
+dpDir <- paste0(output, '/distal-peak')
+if (!dir.exists(dpDir)) dir.create(dpDir)
+outDataDir <- paste0(dpDir, '/data')
+if (!dir.exists(outDataDir)) dir.create(outDataDir)
+figDir <- paste0(dpDir, '/figures')
+if (!dir.exists(figDir)) dir.create(figDir)
+
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+```
+
+```{r dstl-peaks}
+# load distal peaks
+dstlPeaks <- read.table(distalPeakFile, sep = '\t')
+rownames(dstlPeaks) <- paste(dstlPeaks[, 1], dstlPeaks[, 2], dstlPeaks[, 3], sep = ':')
+# remove peaks that do not have quantification data
+peakNoQtf <- rownames(dstlPeaks)[!(rownames(dstlPeaks) %in% rownames(peakNorm))]
+if (length(peakNoQtf) > 0) {
+  dstlPeaks <- dstlPeaks[rownames(dstlPeaks) %in% rownames(peakNorm), ]
+}
+
+# compose the feature annotation file 
+promBed <- read.table(promBedFile, sep = '\t')
+promCent <- (promBed[, 3] - promBed[, 2] - 1) / 2 + promBed[, 2]
+if (feature == 'gene') {
+  featAnn <- data.frame(gene_id = promBed[, 4], chr = promBed[, 1], start = promCent)
+} else if (feature == 'transcript') {
+  featAnn <- data.frame(transcript_id = promBed[, 5], chr = promBed[, 1], start = promCent)
+} else {
+  stop(sprintf('Unknown feature: %s', feature))
+}
+
+# identify the closest feature to distal peaks
+closFeat <- closestFeat(dstlPeaks, featAnn)
+rownames(closFeat) <- rownames(dstlPeaks)
+# exclude peaks that do not have an associated feature
+closFeat <- closFeat[closFeat[, 1] != '', ]
+nPeakRm <- nrow(dstlPeaks) - nrow(closFeat)
+dstlPeaks <- dstlPeaks[rownames(dstlPeaks) %in% rownames(closFeat), ]
+write.csv(cbind(peak = rownames(closFeat), closFeat), 
+          paste0(outDataDir, '/distal-peak-feature.csv'), row.names = FALSE, quote = FALSE)
+```
+
+There are in total `r printNum(nrow(dstlPeaks) + length(peakNoQtf) + nPeakRm)` distal peaks. `r if (length(peakNoQtf) > 0) sprintf('Among them, there are %s peak(s) that do not appear in "*peakTpmFile*" and were excluded from the analysis.', printNum(length(peakNoQtf)))` Each peak was paired with the `r feature` whose TSS is the closest to the peak among all `feature`s in the same chromosome. Peaks that locate in chromosomes where there is no annotated `r feature` were excluded from the subsequent analysis. There are `r printNum(nPeakRm)` such peaks. The pairing of peak and `r feature` was saved to *data/distal-peak-feature.csv*, together with the distance between the peak to the TSS of the `r feature`. The distribution of such distance among all peaks is plotted in the figure below (*peak-feat-dist-1.pdf*):
+
+```{r peak-feat-dist, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotPFDist(closFeat[, 2])
+```
+
+The following is a plot of CpG density of all distal peaks (*dstl-cpg-dens-1.pdf*):
+
+```{r dstl-cpg-dens, fig.width=6, fig.height=4, dev=c('png', 'pdf')}
+dstlCpgDens <- peakCpgDens[rownames(dstlPeaks)]
+plotCpGDens(dstlCpgDens)
+
+# identify peaks with low, medium and high CpG density .
+dstlByCpGDens <- list()
+dstlByCpGDens$low <- names(dstlCpgDens)[dstlCpgDens < cpgDensT[1]]
+dstlByCpGDens$medium <- names(dstlCpgDens)[dstlCpgDens >= cpgDensT[1] & dstlCpgDens <= cpgDensT[2]]
+dstlByCpGDens$high <- names(dstlCpgDens)[dstlCpgDens > cpgDensT[2]]
+```
+
+All distal peaks were classified into three categories according to their CpG density: low (< `r cpgDens[1]`), medium ($\ge$ `r cpgDens[1]` and $\le$ `r cpgDens[2]`) and high (> `r cpgDens[2]`). The distribution of the peaks across the three categories is as follows: 
+
+```{r dstl-cpg-dist}
+knitr::kable(cbind(Density = c('Low', 'Medium', 'High'), 
+                     'Number of peaks' = c(length(dstlByCpGDens$low), length(dstlByCpGDens$medium), 
+                                         length(dstlByCpGDens$high))), 
+             row.names = FALSE, align = 'lc',
+             caption = 'The distribution of distal peaks across the three CpG density categories')
+
+```
+
+
+## Correlation of peak accessibility and paired `r feature` expression
+
+```{r calc-EP-cor, fig.width=6, fig.height=5, dev=c('png', 'pdf')}
+epCorByPeak <- calcEPCorByPeak(expNormCom, peakNormCom, closFeat,
+                   saveToFile = paste0(outDataDir, '/ep-cor-by-peak.csv'))
+```
+
+Pearson correlation between peak accessibility and the expression of paired `r feature`s was computed for each individual peak (*data/ep-cor-by-peak.csv*). There are `r length(which(epCorByPeak$expressed))` peaks whose paired `r feature`s had expression (i.e., showing up in the input "*expCntFile*"). The correlations for these peaks were plotted in the top left figure in the panel below (*ep-cor-by-peak-1.pdf*). These peaks were partitioned into subgroups according to their CpG density, i.e., low, medium and high. The rest of the figures in the panel plot these three subgroups separately. The individual plot for each subgroup can be found under directory: *ep-cor-by-peak*.
+
+```{r ep-cor-by-peak, fig.width=7, fig.height=5, dev=c('png', 'pdf')}
+figSubDir <- paste0(figDir, '/ep-cor-by-peak')
+if (!dir.exists(figSubDir)) dir.create(figSubDir)
+# peaks with an expressed pairing-feature
+expPeak <- rownames(epCorByPeak)[epCorByPeak$expressed]
+corOfEPks<- epCorByPeak[expPeak, 'cor']
+names(corOfEPks) <- expPeak
+plotCorrByCD(corOfEPks, dstlByCpGDens, saveToDir = figSubDir)
+```
+
+Peaks with a correlation (with their paired `r feature`s) that is no less than `r minPeakCorT` are considered as peaks that are highly correlated with gene expression. There are `r printNum(length(which(epCorByPeak$cor >= minPeakCorT)))` such peaks. The distance from these peaks to their paired `r feature`s are plotted in below (*hcorr-pf-dist-1.pdf*)`. 
+
+```{r hcorr-pf-dist, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotPFDist(closFeat[rownames(epCorByPeak)[epCorByPeak$cor >= minPeakCorT], 2])
+```
+
+```{r da-peaks}
+daDstlPksByCmp <- list() # DA distal peaks
+daComp <- read.csv(daCompFile)
+for (comp in daComp$Comparison) {
+  daPks <- read.csv(sprintf('%s/%s.csv', daPeakDir, comp))
+  daPks <- daPks[daPks$significant, ]
+  daPks <- paste(daPks[, 2], daPks[, 3], daPks[, 4], sep = ':')
+  daDstlPksByCmp[[comp]] <- daPks[daPks %in% rownames(dstlPeaks)]
+}
+```
+
+Out of the total `r nrow(dstlPeaks)` distal peaks, there are `r length(unique(unlist(daDstlPksByCmp)))` unique peaks showing differential accessibility (DA) in one or more of the pairwise comparisons. The number of distal DA peaks resulted from each of the comparisons is as follows:
+
+```{r da-dstl}
+nDaDstlPkByCmp <- rep(NA, length(daDstlPksByCmp))
+names(nDaDstlPkByCmp) <- names(daDstlPksByCmp)
+for (comp in names(daDstlPksByCmp)) {
+  nDaDstlPkByCmp[comp] <- length(daDstlPksByCmp[[comp]])
+}
+knitr::kable(cbind(Comparison = names(nDaDstlPkByCmp), 'Number of peaks' = nDaDstlPkByCmp), 
+             row.names = FALSE, align = 'lc',
+             caption = 'The number of distal DA peaks from each comparison')
+```
+
+Below is a Histogram plot of distance between DA peaks and their paired `r feature`s (*da-pf-dist-1.pdf*):
+
+```{r da-pf-dist, fig.height=4, fig.width=6, dev=c('png', 'pdf')}
+plotPFDist(closFeat[unique(unlist(daDstlPksByCmp)), 2])
+```
+
+## Expression of paired `r feature`s with DA peaks
+
+This subsection studies the association between the accessibility of DA peaks and the expression of `r feature`s paired with these peaks. 
+
+```{r asso-by-peak}
+peakSets <- readxl::read_xlsx(diffMetaFile, na = 'NA', sheet = 'Distal-peaks')
+dpOutDir <- paste0(dpDir, '/diff-peak')
+if (!dir.exists(dpOutDir)) dir.create(dpOutDir)
+
+out <- NULL
+for (iDp in 1:nrow(peakSets)) {
+  out <- c(out, knitr::knit_expand(file = file.path(knitr::opts_knit$get("output.dir"), "enhancer", "asso-by-peak.Rmd")))
+}
+```
+
+`r paste(knitr::knit(text = out), collapse = '\n')`
+
+```{r motif-enrich, child=if (feature == 'gene') 'motif-enrich.Rmd'}
+```
+
+```{r dstl-peak-clean}
+# restore
+outDataDir <- outDataDirBk
+figDir <- figDirBK
+knitr::opts_chunk$set(fig.path = paste0(figDir, '/'))
+```

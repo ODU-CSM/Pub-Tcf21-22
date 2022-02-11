@@ -1,0 +1,32 @@
+
+
+```{r aggr-de} 
+# use only DE feature
+# load DE feature
+deComps <- read.table(deMetaFile)$V1
+deRes <- NULL
+for (comp in deComps) {
+  compRes <- read.csv(sprintf('%s/%s.csv', deResDir, comp))
+  sigRs <- compRes[compRes$significant, c(1:5, match(c('padj'), names(compRes))), drop = F]
+  if (nrow(sigRs) > 0) {
+    deRes <- rbind(deRes, cbind(sigRs, comparison = rep(comp, nrow(sigRs))))
+  }
+}
+deRes <- deRes[sort(deRes$padj, index.return = TRUE)$ix, ]
+deRes <- deRes[!duplicated(deRes[, 1]), ]
+write.csv(deRes, paste0(outDataDir, '/aggr-de-rs.csv'), row.names = F, quote = F)
+
+deFeats <- deRes[1:nTopDe, 1]
+
+# check if all DE features are in read counts file
+if (length(which(!(deFeats %in% expCntFull[, expIdCol]))) > 0) {
+  warning(paste0('There is(are) %d DE %s(s) that do not have data in the expression read count ',
+                 'data file and will be excluded from analysis. They are: %s.\n'), 
+          length(which(!(deFeats %in% expCntFull$gene_id))), feature, printNames(deFeats[!(deFeats %in% expCntFull$gene_id)]))
+  deFeats <- deFeats[deFeats %in% expCntFull[, expIdCol]]
+}
+```
+
+Deferentially expressed `r feature`s identified in the following pairwise comparisons: `r printNames(deComps)`, were aggregated. There were a total of `r nrow(deRes)` unique such `r feature`s. Among them, the top `r nTopDe` most differentially expressed `r feature`s were included in the subsequent analysis. The extent of differential expression was determined by the adjusted p-value obtained in pairwise differential expression tests. In the case of multiple p-values associated with one gene (resulted from multiple comparisons), the smallest p-value was used. The aggregated DE results sorted according to the adjusted p-value can be found in *aggr-de-rs.csv*, where the "comparison" column provides the comparison that produced the smallest p-value (i.e., the one included in this file).  
+
+
